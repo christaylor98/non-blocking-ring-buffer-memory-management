@@ -60,6 +60,7 @@
 //! need their own stable head pointer (e.g. axAporia Ring 2 reading while
 //! Ring 1 is still appending). Not needed otherwise.
 
+use std::cell::UnsafeCell;
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::marker::PhantomData;
 use std::ptr;
@@ -445,6 +446,148 @@ impl<T: Send> Ring<T> {
 }
 
 // ---------------------------------------------------------------------------
+// SeqCell<T> — seqlock with inline storage, zero allocation
+//
+// For large T (size_of::<T>() > 4) in the mutable-only use case where you
+// want zero heap allocation. Stores T directly inside the struct.
+//
+// ## Seqlock protocol
+//
+//   Write: epoch → ODD  (marks in-progress, AcqRel)
+//          copy value into inline slot  (volatile ptr write)
+//          epoch → EVEN (marks committed, Release)
+//
+//   Read:  loop {
+//            e0 = epoch.load(Acquire) — if ODD, yield and retry
+//            copy value out of inline slot
+//            e1 = epoch.load(Acquire) — if e0 != e1, retry
+//            return (value, e0 / 2)   — epoch normalised to write count
+//          }
+//
+// ## Tradeoffs vs Cell<T> Block path
+//
+//   BETTER:  zero allocation per write; Cell<T> size is fixed (8 bytes)
+//            regardless of T — SeqCell<T> grows with T (inline storage).
+//            No reclamation needed: no heap memory to reclaim.
+//
+//   WORSE:   readers may spin briefly if they land exactly on a write
+//            in progress. Under heavy write pressure from a fast writer,
+//            readers will spin more often. Under light or moderate write
+//            pressure, spin count is effectively zero.
+//
+//            T must be Copy (value is memcpy'd in and out of the slot).
+//
+// ## When to use
+//
+//   Use SeqCell<T> when:
+//     - T > 4 bytes (otherwise Cell<T> inline is already zero allocation)
+//     - You want zero heap allocation (embedded, OS kernel, no_std)
+//     - Write pressure is low to moderate relative to read rate
+//     - Brief reader spin under heavy writes is acceptable
+//
+//   Use Cell<T> Block path when:
+//     - You need readers to never spin under any write pressure
+//     - You already have a reclamation sweep (Block reuse)
+//     - You need the immutable causal chain (append path)
+// ---------------------------------------------------------------------------
+
+pub struct SeqCell<T> {
+    /// Seqlock counter. ODD = write in progress. EVEN = committed.
+    /// Epoch returned to callers is seq / 2 (counts completed writes).
+    seq:     AtomicU64,
+    /// Inline value storage. Written only by the single owning writer.
+    slot:    UnsafeCell<MaybeUninit<T>>,
+    _marker: PhantomData<T>,
+}
+
+unsafe impl<T: Send> Send for SeqCell<T> {}
+unsafe impl<T: Send> Sync for SeqCell<T> {}
+
+impl<T: Copy> SeqCell<T> {
+    pub fn new() -> Self {
+        SeqCell {
+            seq:     AtomicU64::new(0),
+            slot:    UnsafeCell::new(MaybeUninit::uninit()),
+            _marker: PhantomData,
+        }
+    }
+
+    // =========================================================================
+    // WRITE
+    //
+    // SAFETY: must be called by the single owning writer only.
+    //
+    // Bumps seq to ODD (marks in-progress), writes value into inline slot
+    // via volatile copy (prevents compiler from reordering across the seq
+    // stores), then bumps seq to EVEN (marks committed).
+    //
+    // AcqRel on the first bump: ensures readers who load the odd value see
+    // any prior writes. Release on the second bump: ensures the value write
+    // is visible to readers who Acquire the even seq.
+    // =========================================================================
+    pub unsafe fn write(&self, value: T) -> WriteResult {
+        let old_seq = self.seq.load(Ordering::Relaxed);
+        debug_assert!(old_seq % 2 == 0, "writer called write() while write in progress");
+
+        // Mark in-progress. AcqRel so readers see a consistent before-state.
+        self.seq.store(old_seq + 1, Ordering::Release);
+
+        // Volatile copy: prevents the compiler reordering the value write
+        // outside the seq window. Necessary because slot is not atomic.
+        unsafe {
+            ptr::write_volatile(
+                (*self.slot.get()).as_mut_ptr(),
+                value,
+            );
+        }
+
+        // Mark committed. Release pairs with readers' Acquire on seq.
+        let new_seq = old_seq + 2;
+        self.seq.store(new_seq, Ordering::Release);
+        WriteResult { epoch: new_seq / 2 }
+    }
+
+    // =========================================================================
+    // READ
+    //
+    // Spins until it observes two identical even seq values bracketing the
+    // value copy. The spin is a yield loop — it gives up the CPU rather than
+    // burning it on a tight CAS loop, so it behaves well under OS scheduling.
+    //
+    // Returns Empty if the cell has never been written (seq == 0).
+    // Returns Value { missed } using the same semantics as Cell<T>::read.
+    //
+    // Safe from any thread, any number of concurrent readers.
+    // =========================================================================
+    pub fn read(&self, last_epoch: u64) -> ReadResult<T> {
+        loop {
+            let e0 = self.seq.load(Ordering::Acquire);
+            if e0 == 0        { return ReadResult::Empty; }
+            if e0 % 2 == 1    { std::thread::yield_now(); continue; } // write in progress
+
+            // Volatile read: prevents the compiler from hoisting this read
+            // outside the seq bracket.
+            let value = unsafe {
+                ptr::read_volatile((*self.slot.get()).as_ptr())
+            };
+
+            let e1 = self.seq.load(Ordering::Acquire);
+            if e0 != e1       { std::thread::yield_now(); continue; } // write landed mid-read
+
+            let current_epoch = e0 / 2;
+            let missed = if last_epoch == 0 { 0 }
+                         else { current_epoch.saturating_sub(last_epoch + 1) };
+            return ReadResult::Value { value, epoch: current_epoch, missed };
+        }
+    }
+
+    /// Current epoch. Safe to call from any thread.
+    pub fn epoch(&self) -> u64 { self.seq.load(Ordering::Acquire) / 2 }
+}
+
+impl<T: Copy> Default for SeqCell<T> { fn default() -> Self { SeqCell::new() } }
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -728,5 +871,93 @@ mod tests {
 
         let final_val = cell.lock().unwrap().read(0).value().unwrap();
         assert_eq!(final_val, 1999u64);
+    }
+
+    // ── SeqCell<T> ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn seqcell_empty_before_write() {
+        let cell: SeqCell<u64> = SeqCell::new();
+        assert_eq!(cell.read(0), ReadResult::Empty);
+    }
+
+    #[test]
+    fn seqcell_write_read_u64() {
+        let cell = SeqCell::<u64>::new();
+        let w = unsafe { cell.write(42u64) };
+        assert_eq!(w.epoch, 1);
+        assert_eq!(cell.read(0).value(), Some(42u64));
+    }
+
+    #[test]
+    fn seqcell_write_read_large_struct() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct Sensor { temp: f64, pressure: f64, humidity: f64 }
+
+        let cell = SeqCell::<Sensor>::new();
+        unsafe { cell.write(Sensor { temp: 22.5, pressure: 1013.0, humidity: 55.0 }) };
+        let v = cell.read(0).value().unwrap();
+        assert_eq!(v.temp, 22.5);
+        assert_eq!(v.pressure, 1013.0);
+        assert_eq!(v.humidity, 55.0);
+    }
+
+    #[test]
+    fn seqcell_epoch_increments() {
+        let cell = SeqCell::<u64>::new();
+        for i in 1..=10u64 {
+            let w = unsafe { cell.write(i) };
+            assert_eq!(w.epoch, i);
+        }
+        assert_eq!(cell.epoch(), 10);
+    }
+
+    #[test]
+    fn seqcell_missed_writes() {
+        let cell = SeqCell::<u64>::new();
+        for i in 1..=5u64 { unsafe { cell.write(i) }; }
+        let r = cell.read(2);
+        assert_eq!(r.missed(), 2); // missed 3 and 4
+        assert_eq!(r.value(), Some(5u64));
+    }
+
+    #[test]
+    fn seqcell_no_torn_reads_across_threads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
+
+        let cell   = Arc::new(SeqCell::<u64>::new());
+        let done   = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(AtomicUsize::new(0));
+
+        let mut readers = vec![];
+        for _ in 0..4 {
+            let c = Arc::clone(&cell);
+            let d = Arc::clone(&done);
+            let e = Arc::clone(&errors);
+            readers.push(std::thread::spawn(move || {
+                let mut last_epoch = 0u64;
+                while !d.load(AO::Acquire) {
+                    if let ReadResult::Value { value, epoch, .. } = c.read(last_epoch) {
+                        if epoch < last_epoch { e.fetch_add(1, AO::Relaxed); }
+                        last_epoch = epoch;
+                        if value >= 2000 { e.fetch_add(1, AO::Relaxed); }
+                    }
+                }
+            }));
+        }
+
+        let cw = Arc::clone(&cell);
+        let writer = std::thread::spawn(move || {
+            for i in 0..2000u64 { unsafe { cw.write(i) }; }
+        });
+
+        writer.join().unwrap();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        for r in readers { r.join().unwrap(); }
+
+        assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "no torn reads or epoch inversions");
+        assert_eq!(cell.read(0).value(), Some(1999u64));
     }
 }
