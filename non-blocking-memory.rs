@@ -1,4 +1,4 @@
-//! # axOS Memory Model — v0.8
+//! # axOS Memory Model — v0.9
 //!
 //! ## The design
 //!
@@ -6,8 +6,8 @@
 //!
 //! ```text
 //! Cell<T>
-//!   head:  AtomicU64   ← current value (inline ≤4B) or *const Block<T>
-//!   epoch: AtomicU64   ← write counter, unified backpressure signal
+//!   head: AtomicU64   ← inline: bit[0]=tag, bits[32:1]=value, bits[63:33]=epoch
+//!                        pointer: *const Block<T>; epoch lives inside Block
 //! ```
 //!
 //! The ring buffer is gone. It was solving three problems that don't
@@ -15,36 +15,44 @@
 //!
 //!   1. Locating current head   → single AtomicU64 head does this
 //!   2. Retention / history     → Block.prev chain already IS the history
-//!   3. Reclamation boundary    → epoch tracks this directly
+//!   3. Reclamation boundary    → epoch inside Block tracks this directly
 //!
 //! ## Write modes
 //!
-//! `write(v)`   — mutable replace. ≤4B: inline in head. >4B: swap Block pointer.
-//!               Old Block leaked until reclamation sweep (TODO).
+//! `write(v)`   — mutable replace. ≤4B: inline in head (zero allocation).
+//!               >4B: swaps Block pointer; old Block leaks until reclamation
+//!               sweep. See TRADEOFF comment on write().
 //!
 //! `append(v)`  — immutable extend. Always allocates Block. new.prev = old head.
-//!               Causal chain traversable via ChainIter.
+//!               Causal chain traversable via ChainIter. See TRADEOFF on append().
 //!
-//! ## Epoch = unified backpressure signal
+//! ## Epoch = write counter
 //!
-//! Writer increments epoch on every write (single writer per cell — no atomic
-//! fetch_add needed, just load+1 then store Release).
+//! Writer increments epoch on every write (single writer per cell).
 //!
 //! Reader holds its last-seen epoch. On each read:
 //!   missed = current_epoch - last_epoch - 1
 //!   missed == 0  → reader is current
-//!   missed > N   → reader is behind, caller decides: throttle / escalate / accept
+//!   missed > N   → reader is behind; caller decides: throttle / escalate / accept
 //!
 //! No staging queue. No fail_count. No pressure slots.
 //! The epoch exposes write velocity; policy stays with the caller.
 //!
-//! ## Memory ordering
+//! ## Memory ordering — no separate epoch atomic, no race
 //!
-//! Writer: head (Relaxed) → epoch (Release)
-//! Reader: epoch (Acquire) → head (Relaxed)
+//! Inline path (size_of::<T>() <= 4):
+//!   Writer: single Release store of head (value and epoch packed in one word)
+//!   Reader: single Acquire load of head — value and epoch always consistent
 //!
-//! One Release/Acquire pair per write/read cycle.
-//! No CAS, no fetch_add, no bus lock anywhere.
+//! Block path (size_of::<T>() > 4):
+//!   Writer: Block fully initialised (value, epoch, prev), then Release store
+//!           of the head pointer
+//!   Reader: Acquire load of pointer synchronises with that Release; all Block
+//!           fields visible — value and epoch always consistent
+//!
+//!   Previously a separate `epoch: AtomicU64` was used for synchronisation,
+//!   which left a window where a reader could see a new head with a stale epoch.
+//!   That field is gone: epoch now travels with the data.
 //!
 //! ## Ring (explicit opt-in)
 //!
@@ -103,14 +111,15 @@ impl<T> ReadResult<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Block — heap unit of the immutable causal chain
+// Block — heap unit of the causal chain (and large mutable values)
 // ---------------------------------------------------------------------------
 
 pub struct Block<T> {
     pub value: T,
-    /// Backward causal edge. Null for the first block.
+    /// Backward causal edge. Null for the first block, and for all mutable
+    /// (write) blocks since they carry no history.
     pub prev:  *const Block<T>,
-    /// Epoch at time of creation.
+    /// Epoch at time of creation. Written once at allocation; never changes.
     pub epoch: u64,
 }
 
@@ -125,11 +134,15 @@ impl<T> Block<T> {
 
 // ---------------------------------------------------------------------------
 // Inline encoding helpers
+//
+// Bit layout of an inline head word:
+//   bit  0       = INLINE_TAG (always 1)
+//   bits [32:1]  = value bytes (u32 — covers any T where size_of::<T>() <= 4)
+//   bits [63:33] = epoch (31 bits → max ~2 billion writes per cell)
 // ---------------------------------------------------------------------------
 
-/// Encode a ≤4 byte value into a tagged u64.
-/// Bits 1-32: value bytes. Bit 0: INLINE_TAG.
-unsafe fn encode_inline<T>(value: T) -> u64 {
+/// Encode a ≤4 byte value and its epoch into a tagged u64.
+unsafe fn encode_inline<T>(value: T, epoch: u64) -> u64 {
     debug_assert!(size_of::<T>() <= 4);
     let value = ManuallyDrop::new(value);
     let mut buf = [0u8; 4];
@@ -138,10 +151,11 @@ unsafe fn encode_inline<T>(value: T) -> u64 {
         buf.as_mut_ptr(),
         size_of::<T>(),
     );
-    ((u32::from_ne_bytes(buf) as u64) << 1) | INLINE_TAG
+    (epoch << 33) | ((u32::from_ne_bytes(buf) as u64) << 1) | INLINE_TAG
 }
 
 /// Decode a ≤4 byte value from a tagged u64.
+/// The cast to u32 naturally truncates bits[63:33] (epoch), leaving bits[32:1].
 unsafe fn decode_inline<T>(bits: u64) -> T {
     debug_assert!(bits & INLINE_TAG != 0);
     let value_u32 = (bits >> 1) as u32;
@@ -160,11 +174,10 @@ unsafe fn decode_inline<T>(bits: u64) -> T {
 // ---------------------------------------------------------------------------
 
 pub struct Cell<T> {
-    /// Current value: inline (bit 0 = 1) or *const Block<T> (bit 0 = 0).
+    /// Inline (bit 0 = 1): bits[32:1] = value bytes, bits[63:33] = epoch.
+    /// Pointer (bit 0 = 0): *const Block<T>; epoch lives in Block.epoch.
+    /// Zero = never written.
     head:    AtomicU64,
-    /// Write counter. Incremented by the single owning writer on every write.
-    /// Stored with Release. Read with Acquire.
-    epoch:   AtomicU64,
     _marker: PhantomData<*const Block<T>>,
 }
 
@@ -173,70 +186,77 @@ unsafe impl<T: Send> Sync for Cell<T> {}
 
 impl<T> Cell<T> {
     pub fn new() -> Self {
-        Cell {
-            head:    AtomicU64::new(0),
-            epoch:   AtomicU64::new(0),
-            _marker: PhantomData,
-        }
+        Cell { head: AtomicU64::new(0), _marker: PhantomData }
+    }
+
+    /// Read epoch from current head using Relaxed ordering (writer-side only).
+    fn writer_epoch(&self) -> u64 {
+        let bits = self.head.load(Ordering::Relaxed);
+        if bits == 0 { 0 }
+        else if bits & INLINE_TAG != 0 { bits >> 33 }
+        else { unsafe { (*(bits as *const Block<T>)).epoch } }
     }
 
     // =========================================================================
     // WRITE: mutable replace
     //
-    // ≤4 bytes: encode inline in head field. Zero allocation.
-    // >4 bytes: allocate Block, swap head pointer. No prev (mutable = no chain).
+    // ≤4 bytes — INLINE PATH
+    //   Value and epoch packed into one u64. Single Release store.
+    //   Zero allocation. Single Acquire load on the read side gives a
+    //   consistent (value, epoch) pair — no race possible.
     //
-    // Old Block leaked until reclamation sweep. This is safe because readers
-    // hold direct Block pointers, not ring slots. Sweep determines liveness
-    // via epoch: once all readers have advanced past old_epoch, old Block
-    // is unreachable and can be freed.
+    // >4 bytes — BLOCK PATH
+    //   Allocates one Block per write. Block is fully initialised before
+    //   the head pointer is published via Release store, so readers see a
+    //   consistent (value, epoch) after a single Acquire load of the pointer.
+    //
+    //   TRADEOFF: one heap allocation per write. Old Blocks are leaked until
+    //   a reclamation sweep frees them (epoch-based: safe once all readers
+    //   have advanced past the old epoch — TODO). If your T fits in ≤4 bytes,
+    //   use a newtype or bit-pack it to stay on the inline path.
     //
     // SAFETY: must be called by the single owning writer only.
     // =========================================================================
 
     pub unsafe fn write(&mut self, value: T) -> WriteResult {
-        let new_epoch = self.epoch.load(Ordering::Relaxed) + 1;
+        let new_epoch = self.writer_epoch() + 1;
 
         if size_of::<T>() <= 4 {
-            // Small value: inline in head field, zero allocation
-            self.head.store(encode_inline(value), Ordering::Relaxed);
+            self.head.store(encode_inline(value, new_epoch), Ordering::Release);
         } else {
-            // Large value: heap Block, no prev pointer (mutable, no chain)
             let block = Block::allocate(value, ptr::null(), new_epoch);
-            self.head.store(block as u64, Ordering::Relaxed);
+            self.head.store(block as u64, Ordering::Release);
         }
-
-        // Epoch written LAST (Release): makes head visible to all Acquire reads
-        self.epoch.store(new_epoch, Ordering::Release);
         WriteResult { epoch: new_epoch }
     }
 
     // =========================================================================
     // APPEND: immutable extend
     //
-    // Always allocates a Block. Sets prev = current head.
-    // Builds the causal chain: new → old → older → ...
-    // ChainIter traverses it newest-first.
+    // Always allocates a Block regardless of T size. Sets prev = current head,
+    // building a causal chain traversable via ChainIter (newest → oldest).
+    //
+    // TRADEOFF: one heap allocation per append, and old Blocks are never freed
+    // — freeing any Block requires knowing that no reader holds a pointer
+    // anywhere in the chain behind it, which demands a separate epoch-based
+    // sweep (TODO). Suitable for audit-log / event-history use where retention
+    // is the point. If you only need the latest value, use write() instead.
     //
     // SAFETY: must be called by the single owning writer only.
     // =========================================================================
 
     pub unsafe fn append(&mut self, value: T) -> WriteResult {
-        let new_epoch = self.epoch.load(Ordering::Relaxed) + 1;
+        let new_epoch = self.writer_epoch() + 1;
 
-        // Capture current head as prev (backward causal edge)
         let prev_bits = self.head.load(Ordering::Relaxed);
         let prev: *const Block<T> = if prev_bits == 0 || prev_bits & INLINE_TAG != 0 {
-            ptr::null() // empty or inline (mutable→immutable transition)
+            ptr::null()
         } else {
             prev_bits as *const Block<T>
         };
 
         let block = Block::allocate(value, prev, new_epoch);
-
-        // head (Relaxed) then epoch (Release) — same ordering guarantee as write
-        self.head.store(block as u64, Ordering::Relaxed);
-        self.epoch.store(new_epoch, Ordering::Release);
+        self.head.store(block as u64, Ordering::Release);
         WriteResult { epoch: new_epoch }
     }
 
@@ -250,56 +270,49 @@ impl<T> Cell<T> {
             prev_bits as *const Block<T>
         };
         let block = Block::allocate(value, prev, epoch);
-        self.head.store(block as u64, Ordering::Relaxed);
-        self.epoch.store(epoch, Ordering::Release);
+        self.head.store(block as u64, Ordering::Release);
         WriteResult { epoch }
     }
 
     pub unsafe fn write_with_epoch(&mut self, value: T, epoch: u64) -> WriteResult {
         if size_of::<T>() <= 4 {
-            self.head.store(encode_inline(value), Ordering::Relaxed);
+            self.head.store(encode_inline(value, epoch), Ordering::Release);
         } else {
             let block = Block::allocate(value, ptr::null(), epoch);
-            self.head.store(block as u64, Ordering::Relaxed);
+            self.head.store(block as u64, Ordering::Release);
         }
-        self.epoch.store(epoch, Ordering::Release);
         WriteResult { epoch }
     }
 
     // =========================================================================
     // READ
     //
-    // Epoch loaded FIRST (Acquire): synchronises with writer's Release store.
-    // Head loaded AFTER (Relaxed): guaranteed visible by the Acquire above.
+    // Single Acquire load of head.
+    //   Inline: epoch is in bits[63:33] of the same word as the value.
+    //   Block:  Acquire pairs with writer's Release; Block.epoch visible.
     //
-    // last_epoch: caller's last seen epoch (0 = first read).
-    // missed: writes caller didn't observe since last_epoch.
+    // In both cases value and epoch come from the same atomic operation,
+    // so they are always mutually consistent.
+    //
+    // last_epoch: caller's last seen epoch (0 = first read, missed = 0).
     //
     // Safe from any thread, any number of concurrent readers.
     // Never blocks, never spins.
     // =========================================================================
 
     pub fn read(&self, last_epoch: u64) -> ReadResult<T> where T: Clone {
-        // Acquire: all writes the owner did before storing this epoch are visible
-        let current_epoch = self.epoch.load(Ordering::Acquire);
-        if current_epoch == 0 { return ReadResult::Empty; }
-
-        let bits = self.head.load(Ordering::Relaxed);
+        let bits = self.head.load(Ordering::Acquire);
         if bits == 0 { return ReadResult::Empty; }
 
-        let value = if bits & INLINE_TAG != 0 {
-            unsafe { decode_inline::<T>(bits) }
+        let (value, current_epoch) = if bits & INLINE_TAG != 0 {
+            (unsafe { decode_inline::<T>(bits) }, bits >> 33)
         } else {
-            unsafe { (*( bits as *const Block<T>)).value.clone() }
+            let block = unsafe { &*(bits as *const Block<T>) };
+            (block.value.clone(), block.epoch)
         };
 
-        // missed = how many writes happened between last read and this read
-        // last_epoch=0 means first read, missed=0
-        let missed = if last_epoch == 0 {
-            0
-        } else {
-            current_epoch.saturating_sub(last_epoch + 1)
-        };
+        let missed = if last_epoch == 0 { 0 }
+                     else { current_epoch.saturating_sub(last_epoch + 1) };
 
         ReadResult::Value { value, epoch: current_epoch, missed }
     }
@@ -308,7 +321,7 @@ impl<T> Cell<T> {
     // CHAIN — traverse immutable causal history
     //
     // Returns iterator over Block values, newest first.
-    // Only meaningful after append() calls (write() sets no prev).
+    // Only meaningful after append() calls (write() sets prev = null).
     // =========================================================================
 
     pub fn chain(&self) -> ChainIter<T> {
@@ -320,8 +333,13 @@ impl<T> Cell<T> {
         }
     }
 
-    /// Current epoch. Use to check write velocity.
-    pub fn epoch(&self) -> u64 { self.epoch.load(Ordering::Acquire) }
+    /// Current epoch. Safe to call from any thread.
+    pub fn epoch(&self) -> u64 {
+        let bits = self.head.load(Ordering::Acquire);
+        if bits == 0 { 0 }
+        else if bits & INLINE_TAG != 0 { bits >> 33 }
+        else { unsafe { (*(bits as *const Block<T>)).epoch } }
+    }
 
     /// Current head as raw Block pointer. Null if empty or inline.
     pub fn head_ptr(&self) -> *const Block<T> {
@@ -531,7 +549,7 @@ mod tests {
     fn missed_zero_when_current() {
         let mut cell: Cell<u32> = Cell::new();
         let w = unsafe { cell.write(1) };
-        let r = cell.read(w.epoch - 1); // pass previous epoch
+        let r = cell.read(w.epoch - 1);
         assert_eq!(r.missed(), 0, "no missed writes when fully current");
     }
 
@@ -553,7 +571,6 @@ mod tests {
     fn missed_zero_on_first_read() {
         let mut cell: Cell<u32> = Cell::new();
         for _ in 0..10 { unsafe { cell.write(42) }; }
-        // last_epoch=0 means "first read, no baseline"
         let r = cell.read(0);
         assert_eq!(r.missed(), 0, "first read: missed is always 0");
     }
@@ -561,18 +578,31 @@ mod tests {
     #[test]
     fn caller_can_detect_write_pressure() {
         let mut cell: Cell<u32> = Cell::new();
-        // Simulate fast writer: 1000 writes before reader checks
         for i in 0..1000u32 { unsafe { cell.write(i) }; }
 
-        let r = cell.read(0); // first read: missed=0 (no baseline)
+        let r = cell.read(0);
         let last = r.epoch();
 
-        // Simulate more writes while reader is "busy"
         for i in 1000..1050u32 { unsafe { cell.write(i) }; }
 
         let r2 = cell.read(last);
         assert_eq!(r2.missed(), 49, "reader missed 49 writes");
-        // Caller can now decide: throttle writer, escalate, or accept the lag
+    }
+
+    // ── Inline: epoch packed in same word as value ────────────────────────────
+
+    #[test]
+    fn inline_epoch_consistent_with_value() {
+        // Verifies that for inline values the epoch extracted from read()
+        // always matches the epoch returned by write() — they come from the
+        // same atomic word so there is no window for inconsistency.
+        let mut cell: Cell<u32> = Cell::new();
+        for i in 1..=20u32 {
+            let w = unsafe { cell.write(i) };
+            let r = cell.read(0);
+            assert_eq!(r.epoch(), w.epoch, "epoch in read must match write");
+            assert_eq!(r.value(), Some(i));
+        }
     }
 
     // ── Immutable append: causal chain ───────────────────────────────────────
@@ -593,7 +623,7 @@ mod tests {
 
         let head = cell.head_ptr();
         assert!(!head.is_null());
-        assert_eq!(unsafe { (*head).epoch }, 3); // latest block has epoch 3
+        assert_eq!(unsafe { (*head).epoch }, 3);
         assert_eq!(unsafe { (*(*head).prev).epoch }, 2);
         assert_eq!(unsafe { (*(*(*head).prev).prev).epoch }, 1);
     }
@@ -603,14 +633,11 @@ mod tests {
         let mut cell: Cell<u64> = Cell::new();
         for i in 0..6u64 { unsafe { cell.append(i) }; }
 
-        // Capture a snapshot pointer
         let snap = cell.head_ptr();
         assert_eq!(unsafe { (*snap).value }, 5);
 
-        // More writes
         for i in 6..20u64 { unsafe { cell.append(i) }; }
 
-        // Snapshot still valid — Block is immutable, not freed
         assert_eq!(unsafe { (*snap).value }, 5, "snapshot must be stable");
     }
 
@@ -618,10 +645,11 @@ mod tests {
 
     #[test]
     fn cell_is_minimal() {
-        // Cell<T> is exactly two AtomicU64 = 16 bytes (plus PhantomData = 0)
-        assert_eq!(std::mem::size_of::<Cell<u32>>(), 16);
-        assert_eq!(std::mem::size_of::<Cell<u64>>(), 16);
-        assert_eq!(std::mem::size_of::<Cell<[u8; 256]>>(), 16);
+        // Cell<T> is exactly one AtomicU64 = 8 bytes (epoch removed: lives in
+        // the inline word or in Block, not as a separate field).
+        assert_eq!(std::mem::size_of::<Cell<u32>>(), 8);
+        assert_eq!(std::mem::size_of::<Cell<u64>>(), 8);
+        assert_eq!(std::mem::size_of::<Cell<[u8; 256]>>(), 8);
     }
 
     // ── Ring: explicit N-snapshot layer ──────────────────────────────────────
@@ -630,8 +658,6 @@ mod tests {
     fn ring_retains_n_snapshots() {
         let mut ring: Ring<u64> = Ring::new(4);
         for i in 0..4u64 { unsafe { ring.append(i) }; }
-
-        // Most recent read
         assert_eq!(ring.read(0).value(), Some(3u64));
     }
 
@@ -640,7 +666,6 @@ mod tests {
         let mut ring: Ring<u64> = Ring::new(8);
         for i in 1..=8u64 { unsafe { ring.append(i) }; }
 
-        // Read the snapshot that was at epoch 3
         match ring.read_at_epoch(3) {
             ReadResult::Value { value, epoch, .. } => {
                 assert_eq!(epoch, 3);
@@ -654,11 +679,10 @@ mod tests {
     fn ring_cycles_correctly() {
         let mut ring: Ring<u64> = Ring::new(2);
         for i in 0..6u64 { unsafe { ring.append(i) }; }
-        // Latest is 5
         assert_eq!(ring.read(0).value(), Some(5u64));
     }
 
-    // ── Memory ordering: one Release/Acquire pair ─────────────────────────────
+    // ── Memory ordering: one Release/Acquire per write/read ──────────────────
 
     #[test]
     fn no_torn_reads_across_threads() {
@@ -679,16 +703,9 @@ mod tests {
                 while !d.load(AO::Acquire) {
                     let r = c.lock().unwrap().read(last_epoch);
                     if let ReadResult::Value { value, epoch, .. } = r {
-                        // Value and epoch must be consistent
-                        // epoch must always advance (never go backward)
-                        if epoch < last_epoch {
-                            e.fetch_add(1, AO::Relaxed);
-                        }
+                        if epoch < last_epoch { e.fetch_add(1, AO::Relaxed); }
                         last_epoch = epoch;
-                        // value must be in valid range (0..2000)
-                        if value >= 2000 {
-                            e.fetch_add(1, AO::Relaxed);
-                        }
+                        if value >= 2000 { e.fetch_add(1, AO::Relaxed); }
                     }
                     std::thread::yield_now();
                 }
