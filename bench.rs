@@ -106,6 +106,29 @@ fn bench_single() {
         row!("Cell<u32>  read   (inline, 1 Acquire)", ops, t.elapsed().as_secs_f64(), baseline);
     }
 
+    // SeqCell<u32> write — seqlock on a small type (3 atomic ops vs Cell's 1)
+    {
+        let cell = SeqCell::<u32>::new();
+        let mut i = 0u32;
+        let t = Instant::now();
+        while t.elapsed() < bench_dur() { unsafe { cell.write(i) }; i = i.wrapping_add(1); }
+        row!("SeqCell<u32> write (seqlock, small T)", i as u64, t.elapsed().as_secs_f64(), baseline);
+    }
+
+    // SeqCell<u32> read
+    {
+        let cell = SeqCell::<u32>::new();
+        unsafe { cell.write(42u32) };
+        let mut ops = 0u64;
+        let mut last = 0u64;
+        let t = Instant::now();
+        while t.elapsed() < bench_dur() {
+            if let ReadResult::Value { epoch, .. } = cell.read(last) { last = epoch; }
+            ops += 1;
+        }
+        row!("SeqCell<u32> read  (seqlock, small T)", ops, t.elapsed().as_secs_f64(), baseline);
+    }
+
     // Cell<u64> write — Block path: heap alloc per write
     {
         let mut cell: Cell<u64> = Cell::new();
