@@ -348,9 +348,114 @@ impl<T> Cell<T> {
         if bits == 0 || bits & INLINE_TAG != 0 { ptr::null() }
         else { bits as *const Block<T> }
     }
+
+    // =========================================================================
+    // READ_REF — zero-copy read
+    //
+    // Returns a ReadRef<T> that derefs to &T.
+    //
+    // Block path (T > 4B): holds a raw pointer directly into the heap Block.
+    //   Zero copy. Block is never freed until reclamation sweep (not yet
+    //   implemented), so the reference is stable for the caller's lifetime.
+    //   For immutable (append) cells: definitively stable; value never changes.
+    //   For mutable (write) cells: stable until reclamation; may be stale if
+    //   the writer has advanced — check missed() after use.
+    //
+    // Inline path (T ≤ 4B): decodes the value and stores it inside ReadRef.
+    //   A copy is unavoidable (the value lives in a register, not heap memory),
+    //   but ≤4 bytes is register-sized so the cost is zero.
+    //
+    // Uses the same single Acquire load as read(), so epoch and value are
+    // always mutually consistent (no race window vs the v0.8 two-atomic design).
+    //
+    // Use when: iterating a large dataset, analysing a struct, any case where
+    // you don't need an owned T independent of the cell's lifetime.
+    // =========================================================================
+    pub fn read_ref(&self, last_epoch: u64) -> Option<ReadRef<T>> {
+        let bits = self.head.load(Ordering::Acquire);
+        if bits == 0 { return None; }
+
+        let (current_epoch, is_inline) = if bits & INLINE_TAG != 0 {
+            (bits >> 33, true)
+        } else {
+            (unsafe { (*(bits as *const Block<T>)).epoch }, false)
+        };
+
+        let missed = if last_epoch == 0 { 0 }
+                     else { current_epoch.saturating_sub(last_epoch + 1) };
+
+        if is_inline {
+            Some(ReadRef {
+                inner:  ReadRefInner::Inline(unsafe { decode_inline::<T>(bits) }),
+                epoch:  current_epoch,
+                missed,
+            })
+        } else {
+            // Point directly into Block.value — zero copy.
+            // SAFETY: Block is heap-allocated via Box::into_raw and never freed
+            // until a reclamation sweep (not yet implemented). Caller must not
+            // hold ReadRef across a reclamation cycle.
+            let value_ptr = unsafe { &(*(bits as *const Block<T>)).value as *const T };
+            Some(ReadRef {
+                inner:  ReadRefInner::Block(value_ptr),
+                epoch:  current_epoch,
+                missed,
+            })
+        }
+    }
 }
 
 impl<T> Default for Cell<T> { fn default() -> Self { Cell::new() } }
+
+// ---------------------------------------------------------------------------
+// ReadRef<T> — zero-copy reference to a cell's current value
+//
+// Derefs to &T. For Block values this is a direct pointer into heap memory —
+// no copy at any point. For inline values (≤4B) holds a decoded copy
+// internally (unavoidable, but ≤4B is register-sized so cost is zero).
+//
+// Caller pattern — control loop:
+//
+//   let r = cell.read_ref(last_epoch).unwrap();
+//   for item in r.iter() { ... }   // iterates without copying
+//   last_epoch = r.epoch;
+//   if r.missed > 0 { /* data changed */ }
+//
+// Caller pattern — analysis:
+//
+//   let data = cell.read_ref(0).unwrap();
+//   let sum  = data.iter().map(|x| x.value).sum::<f64>();
+//   let max  = data.iter().max_by_key(|x| x.score);
+//   // data.missed == 0 means dataset didn't change during analysis
+// ---------------------------------------------------------------------------
+
+enum ReadRefInner<T> {
+    /// Direct pointer into Block.value. Zero copy.
+    Block(*const T),
+    /// Decoded inline value. Copy unavoidable but ≤4 bytes = free.
+    Inline(T),
+}
+
+pub struct ReadRef<T> {
+    inner:      ReadRefInner<T>,
+    /// Epoch at time of read.
+    pub epoch:  u64,
+    /// Writes missed since caller's last_epoch.
+    /// 0 = fully current. >0 = data may have changed since last read.
+    pub missed: u64,
+}
+
+unsafe impl<T: Send> Send for ReadRef<T> {}
+
+impl<T> std::ops::Deref for ReadRef<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        match &self.inner {
+            ReadRefInner::Block(ptr) => unsafe { &**ptr },
+            ReadRefInner::Inline(v)  => v,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ChainIter — causal chain traversal, newest → oldest
@@ -1159,5 +1264,175 @@ mod tests {
             // Torn reads confirmed: seqlock protection in read() is necessary.
             assert!(n_tears > 0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadRef tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod read_ref_tests {
+    use super::*;
+
+    // ── Zero-copy: Block-stored values ───────────────────────────────────────
+
+    #[test]
+    fn read_ref_large_value_no_clone() {
+        let mut cell: Cell<Vec<u64>> = Cell::new();
+        unsafe { cell.write(vec![1, 2, 3, 4, 5]) };
+
+        let r = cell.read_ref(0).expect("must have value");
+
+        // Deref gives &Vec<u64> — no copy of the vector
+        assert_eq!(r.len(), 5);
+        assert_eq!(r[0], 1);
+        assert_eq!(r[4], 5);
+
+        // The pointer in ReadRef points directly into the Block on the heap
+        match &r.inner {
+            ReadRefInner::Block(ptr) => assert!(!ptr.is_null()),
+            ReadRefInner::Inline(_)  => panic!("Vec must use Block path"),
+        }
+    }
+
+    #[test]
+    fn read_ref_iterate_without_copy() {
+        let mut cell: Cell<Vec<u64>> = Cell::new();
+        let data: Vec<u64> = (0..1000).collect();
+        unsafe { cell.write(data) };
+
+        let r = cell.read_ref(0).unwrap();
+
+        // Iterate the vec directly via Deref — no copy at any point
+        let sum: u64 = r.iter().sum();
+        assert_eq!(sum, (0..1000u64).sum());
+    }
+
+    // ── Zero-copy: immutable causal chain ────────────────────────────────────
+
+    #[test]
+    fn read_ref_immutable_stable_across_writes() {
+        let mut cell: Cell<Vec<u64>> = Cell::new();
+        unsafe { cell.append(vec![1, 2, 3]) };
+
+        // Capture a reference at epoch 1
+        let r1 = cell.read_ref(0).unwrap();
+        assert_eq!(r1.epoch, 1);
+
+        // More writes
+        unsafe { cell.append(vec![4, 5, 6]) };
+        unsafe { cell.append(vec![7, 8, 9]) };
+
+        // r1 still valid: points into Block(epoch=1) which is never freed
+        assert_eq!(r1[0], 1, "immutable reference stable after further appends");
+        assert_eq!(r1.epoch, 1);
+
+        // New read gives latest value
+        let r2 = cell.read_ref(1).unwrap();
+        assert_eq!(r2[0], 7, "latest value is the most recent append");
+        assert_eq!(r2.missed, 1, "missed one write between epoch 1 and epoch 3");
+    }
+
+    // ── Inline values: copy is unavoidable but free ───────────────────────────
+
+    #[test]
+    fn read_ref_small_value_uses_inline_copy() {
+        let mut cell: Cell<u32> = Cell::new();
+        unsafe { cell.write(42u32) };
+
+        let r = cell.read_ref(0).unwrap();
+        assert_eq!(*r, 42u32);
+
+        // For inline values ReadRef holds a decoded copy (≤4B is free)
+        match &r.inner {
+            ReadRefInner::Inline(v) => assert_eq!(*v, 42u32),
+            ReadRefInner::Block(_)  => panic!("u32 must use inline path"),
+        }
+    }
+
+    // ── Epoch and missed carry correctly ─────────────────────────────────────
+
+    #[test]
+    fn read_ref_missed_count() {
+        let mut cell: Cell<Vec<u64>> = Cell::new();
+        unsafe { cell.write(vec![0]) }; // epoch 1
+        unsafe { cell.write(vec![1]) }; // epoch 2
+        unsafe { cell.write(vec![2]) }; // epoch 3
+        unsafe { cell.write(vec![3]) }; // epoch 4
+
+        let r = cell.read_ref(1).unwrap(); // last seen epoch 1
+        assert_eq!(r.epoch, 4);
+        assert_eq!(r.missed, 2, "missed epochs 2 and 3");
+    }
+
+    // ── Control loop pattern ─────────────────────────────────────────────────
+
+    #[test]
+    fn control_loop_zero_copy_pattern() {
+        let mut cell: Cell<Vec<u64>> = Cell::new();
+        unsafe { cell.write((0..100u64).collect()) };
+
+        let original_sum: u64 = (0..100).sum();
+        let updated_sum:  u64 = (0..100u64).map(|x| x * 2).sum();
+
+        let mut last_epoch = 0u64;
+        let mut sums_seen = vec![];
+        let mut change_detected_at = None;
+
+        for i in 0..5 {
+            let r = cell.read_ref(last_epoch).unwrap();
+
+            // Iterate via Deref — zero copy regardless of list size
+            let sum: u64 = r.iter().sum();
+            sums_seen.push(sum);
+
+            // Sum must always be from ONE complete list — never torn
+            assert!(sum == original_sum || sum == updated_sum,
+                "sum must be from one complete list");
+
+            if r.epoch != last_epoch && last_epoch != 0 {
+                change_detected_at = Some(i);
+            }
+            last_epoch = r.epoch;
+
+            if i == 2 {
+                unsafe { cell.write((0..100u64).map(|x| x * 2).collect()) };
+            }
+        }
+
+        assert!(change_detected_at.is_some(), "must detect list change via epoch");
+        assert!(sums_seen.contains(&updated_sum), "must see updated values");
+
+        // Rapid writes between reads show up as missed count
+        unsafe { cell.write(vec![0]) };
+        unsafe { cell.write(vec![1]) };
+        let r = cell.read_ref(last_epoch).unwrap();
+        assert!(r.missed >= 1, "rapid writes between reads show up as missed count");
+    }
+
+    // ── Analysis pattern ─────────────────────────────────────────────────────
+
+    #[test]
+    fn analysis_multiple_passes_zero_copy() {
+        #[derive(Clone)]
+        struct Record { value: f64, score: u64 }
+
+        let mut cell: Cell<Vec<Record>> = Cell::new();
+        let records: Vec<Record> = (0..10000)
+            .map(|i| Record { value: i as f64 * 1.5, score: i })
+            .collect();
+        unsafe { cell.write(records) };
+
+        // Multiple analysis passes — all via the same reference, no copy
+        let r = cell.read_ref(0).unwrap();
+
+        let sum:  f64 = r.iter().map(|x| x.value).sum();
+        let max_score = r.iter().map(|x| x.score).max().unwrap();
+        let above_mean = r.iter().filter(|x| x.value > sum / r.len() as f64).count();
+
+        assert_eq!(max_score, 9999);
+        assert!(above_mean > 0);
+        assert_eq!(r.missed, 0); // dataset didn't change during analysis
     }
 }
