@@ -765,6 +765,72 @@ fn bench_stress() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. SeqCell size scaling
+// ---------------------------------------------------------------------------
+fn bench_seqcell_sizes() {
+    println!();
+    println!("╔═══════════════════════════════════════════════════════════════════════════╗");
+    println!("║  5. SeqCell<T> size scaling — single thread, no contention               ║");
+    println!("║  How write/read throughput scales with sizeof(T)                         ║");
+    println!("║  protected = seqlock bracket  •  unprotected = raw volatile copy         ║");
+    println!("╠═══════════════╦══════════════╦══════════════════╦════════════════════════╣");
+    println!("║  sizeof(T)    ║  write ops/s ║  read (protected)║  read (unprotected)    ║");
+    println!("╠═══════════════╬══════════════╬══════════════════╬════════════════════════╣");
+
+    macro_rules! row {
+        ($sz:literal) => {{
+            type T = [u8; $sz];
+
+            let cell = SeqCell::<T>::new();
+            let mut wops = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < bench_dur() {
+                unsafe { cell.write([0u8; $sz]) };
+                wops += 1;
+            }
+            let we = t.elapsed().as_secs_f64();
+
+            let cell = SeqCell::<T>::new();
+            unsafe { cell.write([42u8; $sz]) };
+            let mut rops = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < bench_dur() { let _ = cell.read(0); rops += 1; }
+            let re = t.elapsed().as_secs_f64();
+
+            let cell = SeqCell::<T>::new();
+            unsafe { cell.write([42u8; $sz]) };
+            let mut uops = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < bench_dur() { let _ = cell.read_unprotected(); uops += 1; }
+            let ue = t.elapsed().as_secs_f64();
+
+            let w_rate = wops as f64 / we;
+            let r_rate = rops as f64 / re;
+            let u_rate = uops as f64 / ue;
+            println!(
+                "║  {:>10} B    ║  {:>10}    ║  {:>10}  ({:>4.0}%)  ║  {:>10}  ({:>4.0}%)  ║",
+                $sz,
+                fmt_rate(wops, we),
+                fmt_rate(rops, re), r_rate / w_rate * 100.0,
+                fmt_rate(uops, ue), u_rate / w_rate * 100.0,
+            );
+        }};
+    }
+
+    row!(4);
+    row!(8);
+    row!(16);
+    row!(32);
+    row!(64);
+    row!(128);
+    row!(256);
+
+    println!("╚═══════════════╩══════════════╩══════════════════╩════════════════════════╝");
+    println!("  % = throughput relative to write rate of the same size.");
+    println!("  seqlock overhead is ~2 extra atomic ops; copy cost grows with sizeof(T).");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 fn main() {
@@ -779,6 +845,7 @@ fn main() {
     bench_sparse();
     bench_heavy();
     bench_stress();
+    bench_seqcell_sizes();
 
     println!();
     println!("Done.");

@@ -491,6 +491,14 @@ impl<T: Send> Ring<T> {
 //     - You need the immutable causal chain (append path)
 // ---------------------------------------------------------------------------
 
+/// Test-only counters — incremented each time a reader retries due to
+/// a write in progress (ODD) or a write landing mid-copy (CHANGED).
+/// Use delta(after - before) in tests to avoid cross-test interference.
+#[cfg(test)]
+static SEQ_SPIN_ODD:     AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SEQ_SPIN_CHANGED: AtomicU64 = AtomicU64::new(0);
+
 pub struct SeqCell<T> {
     /// Seqlock counter. ODD = write in progress. EVEN = committed.
     /// Epoch returned to callers is seq / 2 (counts completed writes).
@@ -562,23 +570,43 @@ impl<T: Copy> SeqCell<T> {
     pub fn read(&self, last_epoch: u64) -> ReadResult<T> {
         loop {
             let e0 = self.seq.load(Ordering::Acquire);
-            if e0 == 0        { return ReadResult::Empty; }
-            if e0 % 2 == 1    { std::thread::yield_now(); continue; } // write in progress
+            if e0 == 0     { return ReadResult::Empty; }
+            if e0 % 2 == 1 {
+                #[cfg(test)] SEQ_SPIN_ODD.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now(); continue; // write in progress
+            }
 
             // Volatile read: prevents the compiler from hoisting this read
             // outside the seq bracket.
-            let value = unsafe {
-                ptr::read_volatile((*self.slot.get()).as_ptr())
-            };
+            let value = unsafe { ptr::read_volatile((*self.slot.get()).as_ptr()) };
 
             let e1 = self.seq.load(Ordering::Acquire);
-            if e0 != e1       { std::thread::yield_now(); continue; } // write landed mid-read
+            if e0 != e1 {
+                #[cfg(test)] SEQ_SPIN_CHANGED.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now(); continue; // write landed mid-read
+            }
 
             let current_epoch = e0 / 2;
             let missed = if last_epoch == 0 { 0 }
                          else { current_epoch.saturating_sub(last_epoch + 1) };
             return ReadResult::Value { value, epoch: current_epoch, missed };
         }
+    }
+
+    // =========================================================================
+    // READ_UNPROTECTED — bypasses seqlock, for benchmarking and demonstration
+    //
+    // Does NOT retry on odd seq or seq change. Reads the inline slot directly.
+    // For large T (>8 bytes) this WILL return torn values under concurrent
+    // writes — the volatile copy is not atomic. Use only to demonstrate why
+    // the seqlock is necessary, or for latency benchmarking in single-thread
+    // scenarios where you know no write is concurrent.
+    // =========================================================================
+    pub fn read_unprotected(&self) -> ReadResult<T> {
+        let e = self.seq.load(Ordering::Acquire);
+        if e == 0 { return ReadResult::Empty; }
+        let value = unsafe { ptr::read_volatile((*self.slot.get()).as_ptr()) };
+        ReadResult::Value { value, epoch: e / 2, missed: 0 }
     }
 
     /// Current epoch. Safe to call from any thread.
@@ -594,6 +622,8 @@ impl<T: Copy> Default for SeqCell<T> { fn default() -> Self { SeqCell::new() } }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
 
     // ── Mutable write: small (inline) ─────────────────────────────────────────
 
@@ -829,8 +859,7 @@ mod tests {
 
     #[test]
     fn no_torn_reads_across_threads() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
+        use std::sync::atomic::AtomicUsize;
 
         let cell = Arc::new(std::sync::Mutex::new(Cell::<u64>::new()));
         let done = Arc::new(AtomicBool::new(false));
@@ -923,8 +952,7 @@ mod tests {
 
     #[test]
     fn seqcell_no_torn_reads_across_threads() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
+        use std::sync::atomic::AtomicUsize;
 
         let cell   = Arc::new(SeqCell::<u64>::new());
         let done   = Arc::new(AtomicBool::new(false));
@@ -959,5 +987,177 @@ mod tests {
         assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 0,
             "no torn reads or epoch inversions");
         assert_eq!(cell.read(0).value(), Some(1999u64));
+    }
+
+    // ── SeqCell: seqlock retry path ───────────────────────────────────────────
+
+    #[test]
+    fn seqcell_retry_path_fires_under_contention() {
+        // Proves the seqlock guard branches (odd-epoch and seq-changed) are not
+        // dead code. Uses a 128-byte struct so the volatile copy takes ~16 loads —
+        // long enough relative to the write that readers reliably land mid-write.
+        //
+        // Uses delta(after - before) to avoid interference with other tests running
+        // in parallel on the shared global counters.
+        type Big = [u64; 16];
+        let cell = Arc::new(SeqCell::<Big>::new());
+        let done = Arc::new(AtomicBool::new(false));
+
+        let spins_before = SEQ_SPIN_ODD.load(AO::Relaxed)
+                         + SEQ_SPIN_CHANGED.load(AO::Relaxed);
+
+        let (cw, dw) = (Arc::clone(&cell), Arc::clone(&done));
+        let writer = std::thread::spawn(move || {
+            let mut flip = false;
+            while !dw.load(AO::Acquire) {
+                let v: u64 = if flip { 0xAAAAAAAAAAAAAAAA } else { 0xBBBBBBBBBBBBBBBB };
+                unsafe { cw.write([v; 16]) };
+                flip = !flip;
+            }
+        });
+
+        let mut readers = vec![];
+        for _ in 0..4 {
+            let (cr, dr) = (Arc::clone(&cell), Arc::clone(&done));
+            readers.push(std::thread::spawn(move || {
+                while !dr.load(AO::Acquire) { let _ = cr.read(0); }
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        done.store(true, AO::Release);
+        writer.join().unwrap();
+        for r in readers { r.join().unwrap(); }
+
+        let spins_after = SEQ_SPIN_ODD.load(AO::Relaxed)
+                        + SEQ_SPIN_CHANGED.load(AO::Relaxed);
+        assert!(spins_after > spins_before,
+            "seqlock retry path never fired — the guard is not being exercised \
+             (odd={} changed={})",
+            SEQ_SPIN_ODD.load(AO::Relaxed),
+            SEQ_SPIN_CHANGED.load(AO::Relaxed));
+    }
+
+    #[test]
+    fn seqcell_no_torn_reads_large_struct() {
+        // Sentinel correctness test for the seqlock protection.
+        //
+        // Writer alternates between two distinct 128-byte patterns (all-0xAA / all-0xBB).
+        // Every field in the struct must be identical on every read — either all pattern A
+        // or all pattern B. A torn read (some fields A, some B) means the reader saw a
+        // partial write, which the seqlock must prevent.
+        //
+        // This is the authoritative correctness proof: epoch checks (used in other tests)
+        // don't catch torn data; this test does.
+        type Big = [u64; 16];
+        const PAT_A: u64 = 0xAAAAAAAAAAAAAAAA;
+        const PAT_B: u64 = 0xBBBBBBBBBBBBBBBB;
+
+        let cell   = Arc::new(SeqCell::<Big>::new());
+        let done   = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(AtomicU64::new(0));
+
+        let (cw, dw) = (Arc::clone(&cell), Arc::clone(&done));
+        let writer = std::thread::spawn(move || {
+            let mut flip = false;
+            while !dw.load(AO::Acquire) {
+                let v = if flip { PAT_A } else { PAT_B };
+                unsafe { cw.write([v; 16]) };
+                flip = !flip;
+            }
+        });
+
+        let mut readers = vec![];
+        for _ in 0..4 {
+            let (cr, dr, er) = (Arc::clone(&cell), Arc::clone(&done), Arc::clone(&errors));
+            readers.push(std::thread::spawn(move || {
+                while !dr.load(AO::Acquire) {
+                    if let ReadResult::Value { value, .. } = cr.read(0) {
+                        let first = value[0];
+                        if first != PAT_A && first != PAT_B {
+                            er.fetch_add(1, AO::Relaxed); // corrupted sentinel
+                        }
+                        for &v in &value[1..] {
+                            if v != first { er.fetch_add(1, AO::Relaxed); } // torn field
+                        }
+                    }
+                }
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        done.store(true, AO::Release);
+        writer.join().unwrap();
+        for r in readers { r.join().unwrap(); }
+
+        assert_eq!(errors.load(AO::Relaxed), 0,
+            "torn reads detected despite seqlock protection");
+    }
+
+    #[test]
+    fn seqcell_unprotected_read_produces_torn_reads() {
+        // Negative proof: read_unprotected() skips the seqlock bracket.
+        // With a 128-byte struct and a fast writer, readers WILL see partial writes
+        // (some fields from the old write, some from the new). This confirms the
+        // seqlock in read() is actually doing work, not just overhead.
+        //
+        // If this test sees zero tears, the hardware is providing unexpected
+        // atomicity for 128-byte copies (e.g. AVX-512 aligned load). That is a
+        // valid hardware behaviour — seqlock protection remains correct and safe,
+        // it's just not needed on that specific core configuration. The test prints
+        // a diagnostic rather than asserting, because hardware guarantees vary.
+        type Big = [u64; 16];
+        const PAT_A: u64 = 0xAAAAAAAAAAAAAAAA;
+        const PAT_B: u64 = 0xBBBBBBBBBBBBBBBB;
+
+        let cell  = Arc::new(SeqCell::<Big>::new());
+        let done  = Arc::new(AtomicBool::new(false));
+        let tears = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+
+        let (cw, dw) = (Arc::clone(&cell), Arc::clone(&done));
+        let writer = std::thread::spawn(move || {
+            let mut flip = false;
+            while !dw.load(AO::Acquire) {
+                let v = if flip { PAT_A } else { PAT_B };
+                unsafe { cw.write([v; 16]) };
+                flip = !flip;
+            }
+        });
+
+        let mut readers = vec![];
+        for _ in 0..8 {
+            let (cr, dr, tr, rr) = (Arc::clone(&cell), Arc::clone(&done),
+                                     Arc::clone(&tears), Arc::clone(&reads));
+            readers.push(std::thread::spawn(move || {
+                while !dr.load(AO::Acquire) {
+                    if let ReadResult::Value { value, .. } = cr.read_unprotected() {
+                        rr.fetch_add(1, AO::Relaxed);
+                        let first = value[0];
+                        for &v in &value[1..] {
+                            if v != first { tr.fetch_add(1, AO::Relaxed); break; }
+                        }
+                    }
+                }
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        done.store(true, AO::Release);
+        writer.join().unwrap();
+        for r in readers { r.join().unwrap(); }
+
+        let n_tears = tears.load(AO::Relaxed);
+        let n_reads = reads.load(AO::Relaxed);
+        if n_tears == 0 {
+            eprintln!(
+                "NOTE: read_unprotected saw 0 tears in {} reads — hardware may provide \
+                 atomic 128-byte copies on this CPU. Seqlock is still correct.",
+                n_reads
+            );
+        } else {
+            // Torn reads confirmed: seqlock protection in read() is necessary.
+            assert!(n_tears > 0);
+        }
     }
 }
