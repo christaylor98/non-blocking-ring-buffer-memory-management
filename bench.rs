@@ -765,54 +765,102 @@ fn bench_stress() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. SeqCell size scaling
+// 5. Read cost by sizeof(T): Cell<T> (SIMD clone) vs SeqCell (volatile scalar)
+//
+// Answers: why do SeqCell reads get expensive for large T, and how does it
+// compare to normal Rust thread-safe reads?
+//
+// Cell<T> read  = one Acquire load + pointer deref + Clone (compiler uses SIMD)
+// SeqCell read  = two Acquire loads + ptr::read_volatile (scalar, no SIMD)
+// Mutex<T> read = futex CAS (uncontended) + compiler-SIMD copy of T
 // ---------------------------------------------------------------------------
 fn bench_seqcell_sizes() {
     println!();
-    println!("╔═══════════════════════════════════════════════════════════════════════════╗");
-    println!("║  5. SeqCell<T> size scaling — single thread, no contention               ║");
-    println!("║  How write/read throughput scales with sizeof(T)                         ║");
-    println!("║  protected = seqlock bracket  •  unprotected = raw volatile copy         ║");
-    println!("╠═══════════════╦══════════════╦══════════════════╦════════════════════════╣");
-    println!("║  sizeof(T)    ║  write ops/s ║  read (protected)║  read (unprotected)    ║");
-    println!("╠═══════════════╬══════════════╬══════════════════╬════════════════════════╣");
+    println!("╔═══════════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║  5. Read cost by sizeof(T) — SIMD clone (Cell/Mutex) vs volatile scalar (SeqCell)       ║");
+    println!("║  Single thread, no write contention. % relative to Cell<T> read (100% = fastest).       ║");
+    println!("╠════════╦════════════════╦════════════════╦════════════════╦════════════════╦═════════════╣");
+    println!("║  size  ║  Cell<T> read  ║  SeqCell read  ║  SeqCell unprot║  Mutex<T> read ║  Cell/Seq   ║");
+    println!("║        ║  SIMD clone    ║  seqlock+volat ║  volatile only ║  lock+SIMD cpy ║  speedup    ║");
+    println!("╠════════╬════════════════╬════════════════╬════════════════╬════════════════╬═════════════╣");
 
     macro_rules! row {
         ($sz:literal) => {{
             type T = [u8; $sz];
 
-            let cell = SeqCell::<T>::new();
-            let mut wops = 0u64;
+            // Cell<T> read — inline path for ≤4B, Block path for >4B.
+            // Block path: Acquire load of pointer + deref + Clone (SIMD, no volatile).
+            let mut cell = Cell::<T>::new();
+            unsafe { cell.write([42u8; $sz]) };
+            let mut c_ops = 0u64;
+            let mut c_sink = 0u64;
             let t = Instant::now();
             while t.elapsed() < bench_dur() {
-                unsafe { cell.write([0u8; $sz]) };
-                wops += 1;
+                if let ReadResult::Value { value, .. } = cell.read(0) {
+                    c_sink ^= value[0] as u64;
+                }
+                c_ops += 1;
             }
-            let we = t.elapsed().as_secs_f64();
+            let _ = c_sink;
+            let ce = t.elapsed().as_secs_f64();
 
-            let cell = SeqCell::<T>::new();
-            unsafe { cell.write([42u8; $sz]) };
-            let mut rops = 0u64;
+            // SeqCell read (protected) — 2 Acquire loads + ptr::read_volatile (scalar)
+            let cell_s = SeqCell::<T>::new();
+            unsafe { cell_s.write([42u8; $sz]) };
+            let mut r_ops = 0u64;
+            let mut r_sink = 0u64;
             let t = Instant::now();
-            while t.elapsed() < bench_dur() { let _ = cell.read(0); rops += 1; }
+            while t.elapsed() < bench_dur() {
+                if let ReadResult::Value { value, .. } = cell_s.read(0) {
+                    r_sink ^= value[0] as u64;
+                }
+                r_ops += 1;
+            }
+            let _ = r_sink;
             let re = t.elapsed().as_secs_f64();
 
-            let cell = SeqCell::<T>::new();
-            unsafe { cell.write([42u8; $sz]) };
-            let mut uops = 0u64;
+            // SeqCell read (unprotected) — 1 Acquire load + ptr::read_volatile (scalar)
+            let cell_u = SeqCell::<T>::new();
+            unsafe { cell_u.write([42u8; $sz]) };
+            let mut u_ops = 0u64;
+            let mut u_sink = 0u64;
             let t = Instant::now();
-            while t.elapsed() < bench_dur() { let _ = cell.read_unprotected(); uops += 1; }
+            while t.elapsed() < bench_dur() {
+                if let ReadResult::Value { value, .. } = cell_u.read_unprotected() {
+                    u_sink ^= value[0] as u64;
+                }
+                u_ops += 1;
+            }
+            let _ = u_sink;
             let ue = t.elapsed().as_secs_f64();
 
-            let w_rate = wops as f64 / we;
-            let r_rate = rops as f64 / re;
-            let u_rate = uops as f64 / ue;
+            // Mutex<T> read — uncontended futex CAS + compiler-SIMD copy out of lock
+            let mu = Mutex::new([42u8; $sz]);
+            let mut m_ops = 0u64;
+            let mut m_sink = 0u64;
+            let t = Instant::now();
+            while t.elapsed() < bench_dur() {
+                let g = mu.lock().unwrap();
+                let v: T = *g;  // SIMD copy (no volatile constraint)
+                m_sink ^= v[0] as u64;
+                m_ops += 1;
+            }
+            let _ = m_sink;
+            let me = t.elapsed().as_secs_f64();
+
+            let c_rate = c_ops as f64 / ce;
+            let r_rate = r_ops as f64 / re;
+            let u_rate = u_ops as f64 / ue;
+            let m_rate = m_ops as f64 / me;
+
             println!(
-                "║  {:>10} B    ║  {:>10}    ║  {:>10}  ({:>4.0}%)  ║  {:>10}  ({:>4.0}%)  ║",
+                "║ {:>5}B ║ {:>8}  100%  ║ {:>8}  {:>3.0}%  ║ {:>8}  {:>3.0}%  ║ {:>8}  {:>3.0}%  ║  {:>6.1}x   ║",
                 $sz,
-                fmt_rate(wops, we),
-                fmt_rate(rops, re), r_rate / w_rate * 100.0,
-                fmt_rate(uops, ue), u_rate / w_rate * 100.0,
+                fmt_rate(c_ops, ce),
+                fmt_rate(r_ops, re), r_rate / c_rate * 100.0,
+                fmt_rate(u_ops, ue), u_rate / c_rate * 100.0,
+                fmt_rate(m_ops, me), m_rate / c_rate * 100.0,
+                c_rate / r_rate,
             );
         }};
     }
@@ -825,9 +873,11 @@ fn bench_seqcell_sizes() {
     row!(128);
     row!(256);
 
-    println!("╚═══════════════╩══════════════╩══════════════════╩════════════════════════╝");
-    println!("  % = throughput relative to write rate of the same size.");
-    println!("  seqlock overhead is ~2 extra atomic ops; copy cost grows with sizeof(T).");
+    println!("╚════════╩════════════════╩════════════════╩════════════════╩════════════════╩═════════════╝");
+    println!("  Cell<T> and Mutex both use regular Clone/memcpy — the compiler picks SIMD (AVX2/SSE).");
+    println!("  SeqCell uses ptr::read_volatile — the compiler must emit scalar loads, no SIMD.");
+    println!("  Seqlock bracket (protected vs unprotected) adds only 1 extra Acquire load on top.");
+    println!("  Mutex lock is a single uncontended CAS here; multi-thread contention would hurt it.");
 }
 
 // ---------------------------------------------------------------------------
