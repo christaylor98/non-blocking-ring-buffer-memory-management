@@ -83,9 +83,13 @@ const INLINE_TAG: u64 = 1;
 // HOLD_DEPTH  — per-handle nested-ReadRef stack depth. Overflow falls back
 //               to a conservative single floor (see HoldStack).
 // ---------------------------------------------------------------------------
-pub const MAX_READERS: usize = 64;
-pub const WATERMARK:   usize = 256;
-pub const HOLD_DEPTH:  usize = 8;
+pub const MAX_READERS:        usize = 64;
+pub const WATERMARK:          usize = 256;
+pub const HOLD_DEPTH:         usize = 8;
+/// Maximum write-count back-off window between watermark-triggered reclaim
+/// attempts when all reader floors are perpetually pinned. Bounds retired-list
+/// growth to at most `WATERMARK + SWEEP_BACKOFF_CAP` blocks between sweeps.
+pub const SWEEP_BACKOFF_CAP:  u32   = 255;
 
 // ---------------------------------------------------------------------------
 // Results
@@ -403,7 +407,7 @@ impl<T> Cell<T> {
 
         if is_inline {
             Some(ReadRef {
-                inner:       ReadRefInner::Inline(unsafe { decode_inline::<T>(bits) }),
+                inner:       ReadRefInner::Inline((bits >> 1) as u32),
                 epoch:       current_epoch,
                 missed,
                 floor_slot:  ptr::null(),
@@ -438,8 +442,9 @@ impl<T> Default for Cell<T> { fn default() -> Self { Cell::new() } }
 // ReadRef<T> — zero-copy reference to a cell's current value
 //
 // Derefs to &T. For Block values this is a direct pointer into heap memory —
-// no copy at any point. For inline values (≤4B) holds a decoded copy
-// internally (unavoidable, but ≤4B is register-sized so cost is zero).
+// no copy at any point. For inline values (≤4B) the 4 value bytes are kept in a
+// u32 and reinterpreted as &T on deref — no per-T storage, so ReadRef stays
+// small regardless of T (F1).
 //
 // Caller pattern — control loop:
 //
@@ -459,8 +464,15 @@ impl<T> Default for Cell<T> { fn default() -> Self { Cell::new() } }
 enum ReadRefInner<T> {
     /// Direct pointer into Block.value. Zero copy.
     Block(*const T),
-    /// Decoded inline value. Copy unavoidable but ≤4 bytes = free.
-    Inline(T),
+    /// Raw value bytes for an inline (≤4 B) value, packed in a u32 exactly as
+    /// `encode_inline` stored them (bits[32:1] of the head word). Deref
+    /// reinterprets these bytes as `&T` in place — no per-`T` storage, so a
+    /// `ReadRef<[u64;16]>` no longer reserves 128 B it never uses (F1).
+    Inline(u32),
+    /// Seqlock-copied value for AdaptiveCell's cold-path fallback. The Box
+    /// owns the copy; floor_slot is null so Drop is a no-op for the floor
+    /// protocol (Box drop handles T cleanup automatically).
+    Copied(Box<T>),
 }
 
 pub struct ReadRef<T> {
@@ -493,12 +505,29 @@ pub struct ReadRef<T> {
 
 unsafe impl<T: Send> Send for ReadRef<T> {}
 
+impl<T> ReadRef<T> {
+    /// True when this is a zero-copy view into a Block (hot/pinned path).
+    /// False for seqlock copies (inline ≤4 B or AdaptiveCell cold-path).
+    pub fn is_zero_copy(&self) -> bool {
+        matches!(self.inner, ReadRefInner::Block(_))
+    }
+}
+
 impl<T> std::ops::Deref for ReadRef<T> {
     type Target = T;
     fn deref(&self) -> &T {
         match &self.inner {
             ReadRefInner::Block(ptr) => unsafe { &**ptr },
-            ReadRefInner::Inline(v)  => v,
+            ReadRefInner::Inline(raw) => unsafe {
+                // Inline is only built for T with size_of::<T>() <= 4 (hence
+                // align <= 4), so reinterpreting the 4-aligned u32's bytes as
+                // &T is sound and byte-identical to what encode_inline stored.
+                debug_assert!(
+                    std::mem::size_of::<T>() <= 4 && std::mem::align_of::<T>() <= 4
+                );
+                &*(raw as *const u32 as *const T)
+            },
+            ReadRefInner::Copied(b) => b,
         }
     }
 }
@@ -943,8 +972,16 @@ impl HoldStack {
 // USED ONLY IN `acquire()`, which is called ONCE per reader thread's
 // lifetime — never on the hot read / write / reclaim paths. The hard
 // limit "no bus-locking on the hot path" is preserved.
+//
+// F4: each slot is padded to one cache line. A pinned read writes its
+// slot 3× (conservative pre-publish, push, tighten). Without padding,
+// 8 adjacent readers share a line, causing false-share invalidations on
+// every store. One slot per line eliminates that cross-reader traffic.
+#[repr(align(64))]
+struct FloorSlot(AtomicU64);
+
 pub struct ReaderRegistry {
-    slots: [AtomicU64; MAX_READERS],
+    slots: [FloorSlot; MAX_READERS],
     next:  Mutex<usize>,
     /// Monotonic "have we ever issued a ReaderHandle?" flag.
     /// Flipped Release-true on first `acquire()`, never cleared.
@@ -963,7 +1000,7 @@ pub struct ReaderRegistry {
 impl ReaderRegistry {
     pub fn new() -> Self {
         ReaderRegistry {
-            slots: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            slots: std::array::from_fn(|_| FloorSlot(AtomicU64::new(u64::MAX))),
             next:  Mutex::new(0),
             any_handle_ever: std::sync::atomic::AtomicBool::new(false),
         }
@@ -993,7 +1030,7 @@ impl ReaderRegistry {
     pub fn floor_min(&self) -> u64 {
         let mut m = u64::MAX;
         for s in self.slots.iter() {
-            let v = s.load(Ordering::Acquire);
+            let v = s.0.load(Ordering::Acquire);
             if v < m { m = v; }
         }
         m
@@ -1039,7 +1076,7 @@ pub struct ReaderHandle<'reg> {
 impl<'reg> ReaderHandle<'reg> {
     #[inline]
     fn slot_atomic(&self) -> &AtomicU64 {
-        &self.registry.slots[self.slot]
+        &self.registry.slots[self.slot].0
     }
 
     /// Slot index — for test introspection only.
@@ -1086,6 +1123,12 @@ pub struct BridgedCell<T> {
     /// might still be reachable through a live ReadRef. Drained by
     /// reclaim().
     retired: Vec<RetiredEntry<T>>,
+    /// Writes remaining before the next watermark-triggered reclaim attempt.
+    /// Non-zero when back-off is active (floors were starved on last sweep).
+    sweep_skip:    u32,
+    /// Last skip-window length; doubles on each consecutive zero-freed sweep,
+    /// reset to 0 on a successful (freed > 0) sweep.
+    sweep_backoff: u32,
 }
 
 unsafe impl<T: Send> Send for BridgedCell<T> {}
@@ -1093,7 +1136,7 @@ unsafe impl<T: Send> Sync for BridgedCell<T> {}
 
 impl<T> BridgedCell<T> {
     pub fn new() -> Self {
-        BridgedCell { inner: Cell::new(), retired: Vec::new() }
+        BridgedCell { inner: Cell::new(), retired: Vec::new(), sweep_skip: 0, sweep_backoff: 0 }
     }
 
     /// Inner Cell — for callers that need cell-level features (epoch(),
@@ -1193,6 +1236,29 @@ impl<T> BridgedCell<T> {
     }
 
     // =========================================================================
+    // WRITE_WITH_EPOCH — block write with caller-supplied epoch
+    //
+    // Like `write` but stamps the Block with `epoch` instead of the inner
+    // Cell's auto-incremented counter. Used by AdaptiveCell so Block epochs
+    // are driven by the ctrl word (counts ALL writes, both modes). The floor
+    // protocol only requires Block epochs to be monotone; feeding ctrl epochs
+    // satisfies this because ctrl increments strictly on every write.
+    //
+    // SAFETY: same as `write()`. `epoch` must be strictly greater than every
+    // previously published Block epoch for this cell.
+    // =========================================================================
+    pub unsafe fn write_with_epoch(&mut self, value: T, epoch: u64) -> WriteResult {
+        let old_bits = self.inner.head.load(Ordering::Relaxed);
+        let result = unsafe { self.inner.write_with_epoch(value, epoch) };
+        if old_bits != 0 && (old_bits & INLINE_TAG == 0) {
+            let old_ptr = old_bits as *const Block<T>;
+            let retired_epoch = unsafe { (*old_ptr).epoch };
+            self.retired.push(RetiredEntry { ptr: old_ptr, retired_epoch });
+        }
+        result
+    }
+
+    // =========================================================================
     // APPEND (immutable extend) — does NOT retire
     //
     // The chain itself keeps every block reachable, so append blocks are
@@ -1216,6 +1282,15 @@ impl<T> BridgedCell<T> {
     //
     // Rule: escape the read scope → use read(). Stay scoped + zero-copy
     //       → use read_ref().
+    //
+    // F2 HAZARD: owned read() copies from the head Block while pinning
+    // nothing. It is sound only because the single-writer contract
+    // (&mut self for write/reclaim, &self for read) structurally prevents
+    // concurrent reclamation in correctly-typed Rust. Any harness that
+    // shares a BridgedCell across threads with a free-running writer —
+    // Mutex released between ops, UnsafeCell, or future API changes —
+    // makes concurrent owned reads UAF-racy. Prefer read_ref() for the
+    // multi-reader/concurrent-write scenario.
     // =========================================================================
     pub fn read(&self, last_epoch: u64) -> ReadResult<T> where T: Clone {
         self.inner.read(last_epoch)
@@ -1266,7 +1341,7 @@ impl<T> BridgedCell<T> {
             // Decoded copy: pin nothing.
             slot.store(u64::MAX, Ordering::Release);
             Some(ReadRef {
-                inner:       ReadRefInner::Inline(unsafe { decode_inline::<T>(bits) }),
+                inner:       ReadRefInner::Inline((bits >> 1) as u32),
                 epoch:       current_epoch,
                 missed,
                 floor_slot:  ptr::null(),
@@ -1333,21 +1408,35 @@ impl<T> BridgedCell<T> {
     }
 
     // =========================================================================
-    // RECLAIM_IF_WATERMARK — opportunistic gating
+    // RECLAIM_IF_WATERMARK — opportunistic gating with exponential back-off
     //
     // Gates ONLY whether reclaim() runs at all (based on retired list
     // length). When it does run, the floor scan inside reclaim() is
-    // ALWAYS fresh — staleness is bounded by retired_len <= WATERMARK
+    // ALWAYS fresh — staleness is bounded by WATERMARK + SWEEP_BACKOFF_CAP
     // between sweeps, never by a cached floor.
+    //
+    // F5: when floors are permanently pinned (every sweep frees 0 blocks),
+    // the original policy ran the full 64-slot floor scan on every write.
+    // Exponential back-off: after each zero-freed sweep the skip window
+    // doubles (1, 3, 7, … up to SWEEP_BACKOFF_CAP), bounding the scan
+    // overhead while keeping retired_len below WATERMARK + SWEEP_BACKOFF_CAP.
     //
     // Writers can call this opportunistically; readers never do.
     // =========================================================================
     pub fn reclaim_if_watermark(&mut self, registry: &ReaderRegistry) -> usize {
-        if self.retired.len() >= WATERMARK {
-            self.reclaim(registry)
-        } else {
-            0
+        if self.retired.len() < WATERMARK { return 0; }
+        if self.sweep_skip > 0 {
+            self.sweep_skip -= 1;
+            return 0;
         }
+        let freed = self.reclaim(registry);
+        if freed == 0 {
+            self.sweep_backoff = (self.sweep_backoff * 2 + 1).min(SWEEP_BACKOFF_CAP);
+            self.sweep_skip = self.sweep_backoff;
+        } else {
+            self.sweep_backoff = 0;
+        }
+        freed
     }
 }
 
@@ -1593,6 +1682,338 @@ impl<T> DoubleBuffer<T> {
     pub fn front_index(&self) -> usize {
         self.front.load(Ordering::Acquire)
     }
+}
+
+// ===========================================================================
+// AdaptiveCell<T: Copy> — demand-driven SeqCell / BridgedCell hybrid
+// ===========================================================================
+//
+// One cell, two engines, selected per write by the single writer:
+//
+//   COLD = SeqCell-style seqlock on an inline slot. Zero allocation.
+//          Owned reads copy under an odd/even ctrl bracket.
+//   HOT  = BridgedCell block path. One alloc per write; readers hold
+//          floor-pinned zero-copy ReadRefs across subsequent writes.
+//
+// The cell starts COLD. The first time a reader calls read_pinned it
+// stores 1 into its per-handle DEMAND slot (Release store, single writer
+// per slot, no CAS). The writer scans demand before each write (gated
+// behind has_any_reader(), so cells that have never had a reader pay one
+// Acquire load) and escalates. When demand disappears, the writer
+// waits COOL_DOWN writes then de-escalates and drains the retired list.
+//
+// THE SLOT IS CURRENT IN BOTH MODES (hot writes do one extra volatile
+// copy to keep it fresh). This is the load-bearing safety rule:
+// owned read() is a pure seqlock in every mode and NEVER dereferences a
+// Block. Only floor-pinned read_pinned() touches Blocks via the
+// unmodified BridgedCell floor protocol. There are no new free sites.
+//
+// ctrl word layout:
+//   bit  0      MODE        0 = cold, 1 = hot
+//   bit  1      IN-PROGRESS seqlock odd bit
+//   bits 63:2   EPOCH       completed-write count (both modes)
+//
+// Cold write:  ctrl→odd (MODE clear),  write_volatile slot, ctrl→even.
+// Hot write:   ctrl→odd|MODE,          write_volatile slot,
+//              BridgedCell::write_with_epoch (block epoch = ctrl epoch),
+//              ctrl→even|MODE.
+// Escalation   = first hot write (odd store sets MODE).
+// De-escalation = first cold write while hot (odd store clears MODE;
+//              straddling readers fail validation and retry).
+//
+// Owned readers validate exact ctrl match (classic seqlock).
+// Pinned readers serve from block head only when ctrl is even|MODE, then
+// re-check MODE after acquiring the ref; if a de-escalation raced them
+// they drop and retry on the cold path.
+// ===========================================================================
+
+/// ctrl bit 0: 0 = cold (seqlock slot), 1 = hot (block head).
+const MODE_HOT:     u64 = 1;
+/// ctrl bit 1: seqlock in-progress.
+const IN_PROGRESS:  u64 = 2;
+/// Writes without demand before de-escalating. Hysteresis prevents flapping
+/// when a reader is briefly between two read_pinned calls.
+const COOL_DOWN:    u64 = 64;
+/// Hot writes between periodic reclaim sweeps. Bounds per-write sweep cost;
+/// the watermark back-off policy runs independently when floors are pinned.
+const SWEEP_PERIOD: u64 = 8192;
+
+#[inline]
+fn ctrl_epoch(c: u64) -> u64 { c >> 2 }
+
+// ---------------------------------------------------------------------------
+// AdaptiveRegistry — ReaderRegistry plus per-reader DEMAND slots
+// ---------------------------------------------------------------------------
+//
+// demand[i] is written ONLY by the handle owning slot i (store 0 or 1) and
+// read by the writer's demand scan — same single-writer-per-slot rule as the
+// floor slots. No CAS anywhere.
+
+pub struct AdaptiveRegistry {
+    pub floors: ReaderRegistry,
+    demand:     [AtomicU64; MAX_READERS],
+}
+
+impl AdaptiveRegistry {
+    pub fn new() -> Self {
+        AdaptiveRegistry {
+            floors: ReaderRegistry::new(),
+            demand: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// One per reader thread for the thread's lifetime (slots are not
+    /// recycled — same contract as ReaderRegistry::acquire).
+    pub fn acquire(&self) -> AdaptiveHandle<'_> {
+        let floors = self.floors.acquire();
+        let idx = floors.slot_index();
+        AdaptiveHandle { floors, demand: &self.demand[idx] }
+    }
+
+    /// Writer-side scan: does any live handle currently want pinned views?
+    /// Up to MAX_READERS Acquire loads, early exit on first hit.
+    fn any_demand(&self) -> bool {
+        self.demand.iter().any(|s| s.load(Ordering::Acquire) != 0)
+    }
+}
+
+impl Default for AdaptiveRegistry {
+    fn default() -> Self { Self::new() }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveHandle — ReaderHandle plus this reader's demand slot
+// ---------------------------------------------------------------------------
+
+pub struct AdaptiveHandle<'r> {
+    floors: ReaderHandle<'r>,
+    demand: &'r AtomicU64,
+}
+
+impl<'r> AdaptiveHandle<'r> {
+    /// Withdraw this reader's pin demand. Optional — Drop does it too.
+    /// Safe to call while still holding live ReadRefs: those stay valid
+    /// via the floor protocol; the cell may merely de-escalate around them.
+    pub fn release_demand(&self) {
+        self.demand.store(0, Ordering::Release);
+    }
+}
+
+impl<'r> Drop for AdaptiveHandle<'r> {
+    fn drop(&mut self) {
+        // Clear demand first; the inner ReaderHandle Drop then clears the
+        // floor slot. Runs on panic unwind too.
+        self.demand.store(0, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveCell<T: Copy>
+// ---------------------------------------------------------------------------
+
+pub struct AdaptiveCell<T: Copy> {
+    /// Mode + seqlock counter + epoch in one word. See module docs.
+    ctrl:        AtomicU64,
+    /// Cold-mode (and hot-mode mirror) inline slot. Always current.
+    slot:        UnsafeCell<MaybeUninit<T>>,
+    /// Hot-mode block path + retired list.
+    hot:         BridgedCell<T>,
+    /// Writer-private hysteresis counter (no atomicity needed).
+    cool_streak: u64,
+    /// Writer-private hot-write count for periodic sweeping.
+    hot_writes:  u64,
+}
+
+unsafe impl<T: Copy + Send> Send for AdaptiveCell<T> {}
+unsafe impl<T: Copy + Send> Sync for AdaptiveCell<T> {}
+
+impl<T: Copy> AdaptiveCell<T> {
+    pub fn new() -> Self {
+        AdaptiveCell {
+            ctrl:        AtomicU64::new(0),
+            slot:        UnsafeCell::new(MaybeUninit::uninit()),
+            hot:         BridgedCell::new(),
+            cool_streak: 0,
+            hot_writes:  0,
+        }
+    }
+
+    /// True when the cell is currently in hot (block) mode.
+    pub fn is_hot(&self) -> bool {
+        self.ctrl.load(Ordering::Acquire) & MODE_HOT != 0
+    }
+
+    /// Completed writes (ctrl epoch).
+    pub fn epoch(&self) -> u64 {
+        ctrl_epoch(self.ctrl.load(Ordering::Acquire))
+    }
+
+    /// Retired-but-unfreed block count (test / telemetry introspection).
+    pub fn retired_len(&self) -> usize { self.hot.retired_len() }
+
+    /// Manual reclaim passthrough; writes already sweep opportunistically.
+    pub fn reclaim(&mut self, reg: &AdaptiveRegistry) -> usize {
+        self.hot.reclaim(&reg.floors)
+    }
+
+    // =========================================================================
+    // WRITE — the adaptive decision point
+    //
+    // Picks hot or cold for this write based on live demand, then executes
+    // both the slot store (always, so owned reads work in every mode) and
+    // the Block publish (hot path only). Returns the new ctrl epoch.
+    //
+    // SAFETY: single owning writer only (&mut self).
+    // =========================================================================
+    pub unsafe fn write(&mut self, value: T, reg: &AdaptiveRegistry) -> u64 {
+        // Single writer owns ctrl — Relaxed self-load is sufficient.
+        let c = self.ctrl.load(Ordering::Relaxed);
+        let cnt = c >> 1;
+        debug_assert!(cnt & 1 == 0, "write() re-entered during a write");
+        let hot_now = c & MODE_HOT != 0;
+
+        let demand = reg.floors.has_any_reader() && reg.any_demand();
+        let go_hot = if demand {
+            self.cool_streak = 0;
+            true
+        } else if hot_now {
+            self.cool_streak += 1;
+            self.cool_streak < COOL_DOWN
+        } else {
+            false
+        };
+
+        // The epoch that will be written after this call completes.
+        let new_epoch = ctrl_epoch(c) + 1;
+
+        if go_hot {
+            // HOT WRITE: seqlock bracket around BOTH stores so that
+            // owned readers in every mode see a consistent (ctrl, slot) pair,
+            // and pinned readers see a published Block before even|MODE.
+            self.ctrl.store(((cnt + 1) << 1) | MODE_HOT, Ordering::Release);
+            unsafe { ptr::write_volatile((*self.slot.get()).as_mut_ptr(), value) };
+            // Block epoch = ctrl epoch so read_pinned returns a ReadRef whose
+            // .epoch matches what read() returns.
+            unsafe { self.hot.write_with_epoch(value, new_epoch) };
+            self.ctrl.store(((cnt + 2) << 1) | MODE_HOT, Ordering::Release);
+            self.hot_writes += 1;
+            if self.hot_writes % SWEEP_PERIOD == 0 {
+                self.hot.reclaim(&reg.floors);
+            }
+        } else {
+            // COLD WRITE (or de-escalation): odd store clears MODE so
+            // a pinned reader mid-flight sees MODE=0 on validation and retries.
+            self.ctrl.store((cnt + 1) << 1, Ordering::Release);
+            unsafe { ptr::write_volatile((*self.slot.get()).as_mut_ptr(), value) };
+            self.ctrl.store((cnt + 2) << 1, Ordering::Release);
+            if hot_now {
+                // De-escalation: hot head Block is NOT freed — it stays as
+                // BridgedCell's head, fully protected by the floor protocol,
+                // until a later hot write retires it. Drain whatever the
+                // current floors allow.
+                self.cool_streak = 0;
+                self.hot.reclaim(&reg.floors);
+            }
+        }
+        new_epoch
+    }
+
+    // =========================================================================
+    // READ — owned copy, seqlock from slot in EVERY mode (SLOT_MIRRORED_READ)
+    //
+    // Never dereferences a Block; cannot race a reclaim sweep. Exact-match
+    // validation on ctrl handles writes and mode transitions uniformly.
+    // =========================================================================
+    pub fn read(&self, last_epoch: u64) -> ReadResult<T> {
+        loop {
+            let c0 = self.ctrl.load(Ordering::Acquire);
+            if c0 >> 1 == 0 { return ReadResult::Empty; }
+            if c0 & IN_PROGRESS != 0 { std::thread::yield_now(); continue; }
+            let value = unsafe { ptr::read_volatile((*self.slot.get()).as_ptr()) };
+            let c1 = self.ctrl.load(Ordering::Acquire);
+            if c1 != c0 { std::thread::yield_now(); continue; }
+            let epoch  = ctrl_epoch(c0);
+            let missed = if last_epoch == 0 { 0 } else { epoch.saturating_sub(last_epoch + 1) };
+            return ReadResult::Value { value, epoch, missed };
+        }
+    }
+
+    // =========================================================================
+    // READ_PINNED — zero-copy ReadRef when hot, seqlock-copy ReadRef when cold
+    //
+    // Always signals demand first (sticky on the handle until release_demand /
+    // Drop) so the writer escalates even on a cold fallback call.
+    //
+    // Hot path: BridgedCell::read_ref (unmodified floor protocol). Confirms
+    // MODE is still set after acquiring the ref; drops and retries cold if a
+    // de-escalation raced. Returns a floor-pinned ReadRef whose .epoch is the
+    // ctrl epoch (Block epochs are driven by the ctrl counter via
+    // write_with_epoch).
+    //
+    // Cold path: seqlock copy, wrapped in ReadRef::Copied (a boxed value, no
+    // floor pinning, drop is a no-op for the floor protocol). Transitional
+    // — at most a handful of calls before the writer's next write escalates.
+    //
+    // Returns None only if the cell has never been written.
+    // =========================================================================
+    #[inline]
+    pub fn read_pinned(&self, handle: &AdaptiveHandle<'_>, last_epoch: u64) -> Option<ReadRef<T>> {
+        // Sticky demand — load-then-conditional-store keeps the line in M
+        // state only when we actually need to flip (avoids writer-scan stalls
+        // when demand is already set).
+        if handle.demand.load(Ordering::Relaxed) == 0 {
+            handle.demand.store(1, Ordering::Release);
+        }
+
+        loop {
+            let c0 = self.ctrl.load(Ordering::Acquire);
+            if c0 >> 1 == 0 { return None; }
+
+            if c0 & MODE_HOT != 0 {
+                if c0 & IN_PROGRESS != 0 {
+                    // Write in flight: head is not yet published (escalating
+                    // write) or is stale (previous hot period). Wait out.
+                    std::thread::yield_now();
+                    continue;
+                }
+                match self.hot.read_ref(&handle.floors, last_epoch) {
+                    Some(r) => {
+                        let c1 = self.ctrl.load(Ordering::Acquire);
+                        if c1 & MODE_HOT == 0 {
+                            drop(r); // release floor entry
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        return Some(r);
+                    }
+                    None => { std::thread::yield_now(); continue; }
+                }
+            } else {
+                if c0 & IN_PROGRESS != 0 {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let value = unsafe { ptr::read_volatile((*self.slot.get()).as_ptr()) };
+                let c1 = self.ctrl.load(Ordering::Acquire);
+                if c1 != c0 { std::thread::yield_now(); continue; }
+                let epoch  = ctrl_epoch(c0);
+                let missed = if last_epoch == 0 { 0 } else { epoch.saturating_sub(last_epoch + 1) };
+                return Some(ReadRef {
+                    inner:       ReadRefInner::Copied(Box::new(value)),
+                    epoch,
+                    missed,
+                    floor_slot:  ptr::null(),
+                    holds_ptr:   ptr::null_mut(),
+                    hold_epoch:  0,
+                    was_stacked: false,
+                });
+            }
+        }
+    }
+}
+
+impl<T: Copy> Default for AdaptiveCell<T> {
+    fn default() -> Self { Self::new() }
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,6 +2589,7 @@ mod read_ref_tests {
         match &r.inner {
             ReadRefInner::Block(ptr) => assert!(!ptr.is_null()),
             ReadRefInner::Inline(_)  => panic!("Vec must use Block path"),
+            ReadRefInner::Copied(_)  => panic!("Vec must use Block path"),
         }
     }
 
@@ -2219,10 +2641,11 @@ mod read_ref_tests {
         let r = cell.read_ref(0).unwrap();
         assert_eq!(*r, 42u32);
 
-        // For inline values ReadRef holds a decoded copy (≤4B is free)
+        // For inline values ReadRef holds the raw bytes as u32 (≤4B is free)
         match &r.inner {
             ReadRefInner::Inline(v) => assert_eq!(*v, 42u32),
             ReadRefInner::Block(_)  => panic!("u32 must use inline path"),
+            ReadRefInner::Copied(_) => panic!("u32 must use inline path"),
         }
     }
 
@@ -3254,5 +3677,244 @@ mod double_buffer_tests {
         let last = reader.join().unwrap();
         assert_eq!(last, 500, "reader saw the final write");
         assert_eq!(frames.load(AO::Relaxed), 50, "exactly 50 frames observed");
+    }
+
+    // F5: after repeated zero-freed sweeps the back-off must kick in so we
+    // don't pay a 64-slot floor scan on every write.
+    #[test]
+    fn reclaim_if_watermark_backs_off_on_starved_floor() {
+        let reg = ReaderRegistry::new();
+        let handle = reg.acquire();
+        let mut cell: BridgedCell<u64> = BridgedCell::new();
+
+        // First write so read_ref returns Some and we can pin a floor.
+        unsafe { cell.write(0u64) };
+        // Pin floor_min at epoch 1 for the lifetime of this test.
+        let _pin = cell.read_ref(&handle, 0).unwrap();
+
+        // Write well past WATERMARK; each write retires a block, and
+        // reclaim_if_watermark triggers but frees 0 (floor is pinned).
+        for i in 1..=(WATERMARK as u64 + 20) {
+            unsafe { cell.write(i) };
+            cell.reclaim_if_watermark(&reg);
+        }
+
+        // Back-off must have engaged.
+        assert!(cell.sweep_skip > 0,
+            "sweep_skip should be > 0 after repeated zero-freed sweeps");
+
+        // retired_len must be bounded (not growing to MBs).
+        let max_expected = WATERMARK + SWEEP_BACKOFF_CAP as usize + 20;
+        assert!(cell.retired_len() <= max_expected,
+            "retired_len {} exceeds bound {}", cell.retired_len(), max_expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveCell tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+
+    /// Single-writer / multi-reader UnsafeCell harness. The writer calls
+    /// `writer_mut`; everyone else calls `get`. The single-writer contract is
+    /// upheld by test structure, not by a Mutex, so readers never block.
+    struct Shared<T>(UnsafeCell<T>);
+    unsafe impl<T> Send for Shared<T> {}
+    unsafe impl<T> Sync for Shared<T> {}
+    impl<T> Shared<T> {
+        fn new(v: T) -> Self { Shared(UnsafeCell::new(v)) }
+        fn get(&self) -> &T { unsafe { &*self.0.get() } }
+        #[allow(clippy::mut_from_ref)]
+        unsafe fn writer_mut(&self) -> &mut T { unsafe { &mut *self.0.get() } }
+    }
+
+    #[test]
+    fn adaptive_cold_stays_cold_and_correct() {
+        let reg = AdaptiveRegistry::new();
+        let mut cell: AdaptiveCell<u64> = AdaptiveCell::new();
+
+        assert_eq!(cell.read(0), ReadResult::Empty);
+
+        let e = unsafe { cell.write(7, &reg) };
+        assert_eq!(e, 1);
+        assert!(!cell.is_hot());
+        match cell.read(0) {
+            ReadResult::Value { value, epoch, missed } => {
+                assert_eq!(value, 7);
+                assert_eq!(epoch, 1);
+                assert_eq!(missed, 0);
+            }
+            _ => panic!("expected value"),
+        }
+
+        for i in 0..100u64 {
+            unsafe { cell.write(i, &reg) };
+        }
+        assert!(!cell.is_hot(), "no demand → must never escalate");
+        assert_eq!(cell.epoch(), 101);
+        assert_eq!(cell.retired_len(), 0, "cold writes must not allocate blocks");
+        assert_eq!(cell.read(0).value(), Some(99));
+    }
+
+    #[test]
+    fn adaptive_escalates_pins_and_deescalates() {
+        let reg = AdaptiveRegistry::new();
+        let mut cell: AdaptiveCell<[u64; 8]> = AdaptiveCell::new();
+
+        unsafe { cell.write([1; 8], &reg) };
+
+        {
+            let handle = reg.acquire();
+
+            // Cold cell: fallback copy + demand signalled.
+            let p1 = cell.read_pinned(&handle, 0).unwrap();
+            assert!(!p1.is_zero_copy());
+            assert_eq!(*p1, [1; 8]);
+            drop(p1);
+
+            // Writer sees demand on its next write → escalates.
+            unsafe { cell.write([2; 8], &reg) };
+            assert!(cell.is_hot());
+
+            // Now zero-copy.
+            let p2 = cell.read_pinned(&handle, 0).unwrap();
+            assert!(p2.is_zero_copy());
+            assert_eq!(*p2, [2; 8]);
+
+            // Pinned view stays byte-identical across 50 overwrites.
+            for i in 3..53u64 {
+                unsafe { cell.write([i; 8], &reg) };
+            }
+            assert_eq!(*p2, [2; 8], "pinned view must not move under the reader");
+            assert_eq!(cell.read(0).value(), Some([52; 8]), "owned read sees latest");
+            assert!(cell.retired_len() > 0, "overwrites of a pinned block must retire");
+
+            drop(p2);
+            cell.reclaim(&reg);
+            assert_eq!(cell.retired_len(), 0);
+        }
+
+        // No demand → writer cools down over COOL_DOWN writes, then flips cold.
+        for i in 0..(COOL_DOWN + 2) {
+            unsafe { cell.write([100 + i; 8], &reg) };
+        }
+        assert!(!cell.is_hot(), "demand gone → must de-escalate");
+        assert_eq!(cell.retired_len(), 0, "de-escalation sweep must drain retired list");
+        assert_eq!(cell.read(0).value(), Some([100 + COOL_DOWN + 1; 8]));
+
+        // Can escalate again (no one-way ratchet).
+        let handle2 = reg.acquire();
+        let _ = cell.read_pinned(&handle2, 0).unwrap();
+        unsafe { cell.write([777; 8], &reg) };
+        assert!(cell.is_hot());
+        let p = cell.read_pinned(&handle2, 0).unwrap();
+        assert!(p.is_zero_copy());
+        assert_eq!(*p, [777; 8]);
+    }
+
+    #[test]
+    fn adaptive_empty_read_pinned_is_none() {
+        let reg = AdaptiveRegistry::new();
+        let cell: AdaptiveCell<u64> = AdaptiveCell::new();
+        let handle = reg.acquire();
+        assert!(cell.read_pinned(&handle, 0).is_none());
+        // Demand was signalled — first write escalates immediately.
+        let mut cell = cell;
+        unsafe { cell.write(5, &reg) };
+        assert!(cell.is_hot());
+    }
+
+    #[test]
+    fn adaptive_release_demand_with_live_pin_is_safe() {
+        let reg = AdaptiveRegistry::new();
+        let mut cell: AdaptiveCell<[u64; 8]> = AdaptiveCell::new();
+        let handle = reg.acquire();
+
+        unsafe { cell.write([1; 8], &reg) };
+        let _ = cell.read_pinned(&handle, 0); // demand on
+        unsafe { cell.write([2; 8], &reg) };  // hot
+        let p = cell.read_pinned(&handle, 0).unwrap();
+        assert!(p.is_zero_copy());
+
+        // Withdraw demand while the pin is live: cell de-escalates but the
+        // pinned block survives (floor protocol, not demand, guards memory).
+        handle.release_demand();
+        for i in 0..(COOL_DOWN + 2) {
+            unsafe { cell.write([10 + i; 8], &reg) };
+        }
+        assert!(!cell.is_hot());
+        assert_eq!(*p, [2; 8], "pin must outlive de-escalation");
+
+        drop(p);
+        cell.reclaim(&reg);
+        assert_eq!(cell.retired_len(), 0);
+    }
+
+    /// Adversarial: 1 writer flat out, 3 readers mixing owned and pinned
+    /// reads while toggling demand → cell flaps between modes. Lane-equality
+    /// asserts catch torn reads; epoch monotonicity catches time travel;
+    /// final sweep catches leaked reclaimable blocks.
+    #[test]
+    fn adaptive_concurrent_stress_mode_flapping() {
+        const WRITES: u64 = 150_000;
+        let reg = AdaptiveRegistry::new();
+        let shared = Shared::new(AdaptiveCell::<[u64; 4]>::new());
+        let done = AtomicU64::new(0);
+
+        std::thread::scope(|s| {
+            // Writer
+            s.spawn(|| {
+                let cell = unsafe { shared.writer_mut() };
+                for i in 1..=WRITES {
+                    unsafe { cell.write([i; 4], &reg) };
+                }
+                done.store(1, Ordering::Release);
+            });
+
+            // Readers
+            for r in 0..3 {
+                let regr   = &reg;
+                let sharedr = &shared;
+                let doner  = &done;
+                s.spawn(move || {
+                    let handle = regr.acquire();
+                    let mut last_epoch = 0u64;
+                    let mut iter = 0u64;
+                    while doner.load(Ordering::Acquire) == 0 {
+                        iter += 1;
+                        if iter % 64 == r {
+                            if let Some(p) = sharedr.get().read_pinned(&handle, last_epoch) {
+                                let v = *p;
+                                assert!(v[0] == v[1] && v[1] == v[2] && v[2] == v[3],
+                                    "torn pinned read: {v:?}");
+                                std::hint::spin_loop();
+                                assert_eq!(*p, v, "pinned view moved");
+                                assert!(p.epoch >= last_epoch, "epoch went backwards");
+                                last_epoch = p.epoch;
+                            }
+                            if iter % 1024 == 0 {
+                                handle.release_demand(); // force mode flapping
+                            }
+                        } else if let ReadResult::Value { value: v, epoch, .. } =
+                            sharedr.get().read(last_epoch)
+                        {
+                            assert!(v[0] == v[1] && v[1] == v[2] && v[2] == v[3],
+                                "torn owned read: {v:?}");
+                            assert!(epoch >= last_epoch, "epoch went backwards");
+                            last_epoch = epoch;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cell = unsafe { shared.writer_mut() };
+        assert_eq!(cell.read(0).value(), Some([WRITES; 4]));
+        assert_eq!(cell.epoch(), WRITES);
+        cell.reclaim(&reg);
+        assert_eq!(cell.retired_len(), 0, "leak: retired blocks survived final sweep");
     }
 }

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./nbm-test *)",
+      "Bash(./adaptive-test *)",
+      "Bash(./adaptive-bench *)",
+      "Bash(./nbm-asan *)"
+    ]
+  }
+}

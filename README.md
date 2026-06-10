@@ -20,6 +20,7 @@ this repo show those patterns running 1.4×–55× faster than the obvious
 | `Cell<T>` inline (T ≤ 4 B) | Latest-value publish, tiny T (flags, counters, IDs)          | 1 Release store / 1 Acquire load, zero alloc |
 | `SeqCell<T>`         | Large T, `Copy`, no allocation allowed (HFT, embedded, RT)   | 3 atomic ops, zero alloc, brief reader spin  |
 | `BridgedCell<T>`     | Large T, readers hold zero-copy views across writes (RCU)    | 1 alloc per write, lock-free reads           |
+| `AdaptiveCell<T>`    | Demand-driven SeqCell/BridgedCell hybrid; pinned views on demand, seqlock speed otherwise | seqlock speed when cold; 1 alloc/write when hot |
 | `Cell::append` chain | Append-only history (MVCC, Raft log, KV cache)               | 1 alloc per append, never reclaimed*         |
 | `Ring<T>`            | N-snapshot retention (multi-reader staggered views)          | 1 alloc per slot per cycle                   |
 | `SpscQueue<T, N>`    | Bounded single-producer single-consumer FIFO                 | 1 Acquire + 1 Release per side, zero alloc   |
@@ -120,9 +121,10 @@ but requires the caller to manage the swap point).
 ## Picking the right primitive
 
 ```
-size_of::<T>() ≤ 4 ────────────────────────────────────► Cell<T>      (inline)
+size_of::<T>() ≤ 4 ────────────────────────────────────► Cell<T>          (inline)
 T: Copy, writes ≥ reads, brief reader spin OK ─────────► SeqCell<T>
 readers hold pointers across writes (zero-copy) ───────► BridgedCell<T>
+pin demand intermittent or unknown ────────────────────► AdaptiveCell<T>
 producer / consumer FIFO ──────────────────────────────► SpscQueue<T, N>
 frame-boundary publish (caller-managed sync) ──────────► DoubleBuffer<T>
 append-only history retention ─────────────────────────► Cell::append chain
@@ -164,7 +166,7 @@ live in `bench.rs` — sections 1–11.
   byte-exact drop-counter reconciliation at the end proves zero
   double-free and zero leak of reclaimable memory.
 - **AddressSanitizer clean:** `RUSTFLAGS="-Z sanitizer=address" rustc +nightly --test`
-  builds and runs all 60 tests with no ASan diagnostics.
+  builds and runs all 66 tests with no ASan diagnostics.
 - **Panicking-reader test:** a thread that panics while holding a
   `ReadRef` releases its registry slot during unwind (RAII Drop runs on
   panic paths too), and reclamation proceeds normally afterwards.
